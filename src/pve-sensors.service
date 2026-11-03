@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=PVE Sensors Live - unprivileged hardware sensor collector
+After=local-fs.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+DynamicUser=yes
+User=pve-sensors
+Environment=PVE_SENSORS_INTERVAL=0.5
+EnvironmentFile=-/etc/default/pve-sensors
+ExecStart=/usr/bin/python3 -I -B -u /usr/local/libexec/pve-sensors-agent.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5
+RuntimeDirectory=pve-sensors
+RuntimeDirectoryMode=0755
+UMask=0022
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/pve-sensors
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CPUAccounting=yes
+MemoryAccounting=yes
+MemoryMax=96M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

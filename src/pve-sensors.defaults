@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Poll interval in seconds: 0.1 to 60. Default: 0.5 (two reads per second).
+# Faster polling does not make the hardware sensor update faster.
+# Restart only pve-sensors.service after editing this file.
+PVE_SENSORS_INTERVAL=0.5
