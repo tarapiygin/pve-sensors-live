@@ -10,8 +10,6 @@ PVE Sensors Live adds a small, standalone hardware dashboard to a Proxmox VE nod
 
 ![Dark desktop dashboard with a CPU history chart](docs/screenshots/desktop-dark.png)
 
-*Screenshots use synthetic readings and simulated chart history, not a real machine's data. The preview notice is shown only in these documentation captures.*
-
 <details>
 <summary>Light theme and mobile screenshots</summary>
 
