@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOP_LEVEL = (".gitattributes", ".gitignore", "install.sh", "README.md", "LICENSE", "SECURITY.md")
-DIRECTORIES = ("src", "tests", "tools", "docs")
+DIRECTORIES = (".github", "src", "tests", "tools", "docs")
 
 
 def main():

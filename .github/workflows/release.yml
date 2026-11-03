@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require main
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo '::error::Run the Release workflow from main.'
+            exit 1
+          fi
+
+      - name: Check out the release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read version
+        id: version
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          source = Path('src/install.template.sh').read_text()
+          versions = re.findall(r'^VERSION=(\d+\.\d+\.\d+)$', source, re.MULTILINE)
+          if len(versions) != 1:
+              raise SystemExit('Expected one VERSION=x.y.z in the installer template.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'tag=v{versions[0]}\n')
+          PY
+
+      - name: Require a new version
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            echo "::error::Tag $TAG already exists. Update the version and rebuild before releasing again."
+            exit 1
+          fi
+
+      - name: Build and test
+        run: |
+          python3 tools/build_installer.py --check
+          python3 tools/build_installer.py
+          python3 -m unittest discover -s tests -v
+          node --check src/web/pve-sensors.js
+          node tests/test_web.js
+          sha256sum -c SHA256SUMS
+
+      - name: Prepare release files
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          mkdir -p dist
+          cp install.sh dist/install.sh
+          (cd dist && sha256sum install.sh > SHA256SUMS)
+          cat > dist/RELEASE_NOTES.md <<EOF
+          Self-contained installer for PVE Sensors Live $TAG: hardware temperatures and fan speeds in **Node → Sensors**, using your existing Proxmox session.
+
+          Run in an interactive root shell on the Proxmox VE host:
+
+          \`\`\`bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh -o install.sh && bash install.sh
+          \`\`\`
+
+          Installation reloads pvedaemon/pveproxy; guests keep running. Hard-refresh the Proxmox interface after installation. Access requires Sys.Audit on the node.
+
+          Assets: install.sh and SHA256SUMS (checksum of install.sh). To verify, download both files from this release into the same directory and run \`sha256sum -c SHA256SUMS\`.
+
+          Built and tested from commit $GITHUB_SHA. Automated checks cover the collector, API, installer and UI; live-host compatibility checks are documented in docs/VALIDATION.md.
+          EOF
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" dist/install.sh dist/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "PVE Sensors Live $TAG" \
+            --notes-file dist/RELEASE_NOTES.md \
+            --latest
+
+      - name: Verify published files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release download "$TAG" --dir downloaded --pattern install.sh --pattern SHA256SUMS
+          cmp dist/install.sh downloaded/install.sh
+          cmp dist/SHA256SUMS downloaded/SHA256SUMS
+          (cd downloaded && sha256sum -c SHA256SUMS)
+          printf 'Released [%s](https://github.com/%s/releases/tag/%s)\n' \
+            "$TAG" "$GITHUB_REPOSITORY" "$TAG" >> "$GITHUB_STEP_SUMMARY"
