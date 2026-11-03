@@ -21,7 +21,8 @@ class InstallerTests(unittest.TestCase):
     def test_help(self):
         result = subprocess.run(["bash", str(ROOT / "install.sh"), "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
-        self.assertIn("--accept-public-data", result.stdout)
+        self.assertNotIn("--accept-public-data", result.stdout)
+        self.assertIn("reloads pvedaemon/pveproxy", result.stdout)
 
     def test_extract_matches_sources(self):
         with tempfile.TemporaryDirectory() as directory:

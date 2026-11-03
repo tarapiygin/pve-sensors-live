@@ -14,9 +14,9 @@ The screenshots were rendered from the included dashboard with synthetic sensor 
 
 ## Runtime data policy
 
-The public JSON contains only generated sensor IDs, generated labels, categories, roles, numeric measurements, allowed thresholds, timestamps, sampling metadata and a random identifier for the current collector process. The random identifier changes on restart and is not derived from the machine ID, DMI, hostname or network configuration.
+The authenticated JSON contains only generated sensor IDs, generated labels, categories, roles, numeric measurements, allowed thresholds, timestamps, sampling metadata and a random identifier for the current collector process. The random identifier changes on restart and is not derived from the machine ID, DMI, hostname or network configuration.
 
-Custom `sensors` labels and raw chip names are used only locally for classification. They are not copied to the public snapshot. Unknown channels receive generated labels. Synthetic unit tests check that a custom label containing an arbitrary private identifier does not reach the JSON.
+Custom `sensors` labels and raw chip names are used only locally for classification. They are not copied to the runtime snapshot. Unknown channels receive generated labels. Synthetic unit tests check that a custom label containing an arbitrary private identifier does not reach the JSON.
 
 These controls reduce explicit identification. They do not guarantee anonymity: the number and type of sensors and their changing values can disclose coarse hardware and workload information.
 

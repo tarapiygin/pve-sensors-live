@@ -5,6 +5,8 @@ const byId = (id) => document.getElementById(id);
 const numberFormat = new Intl.NumberFormat('en', { maximumFractionDigits: 1 });
 const fmt = (value) => numberFormat.format(value);
 const MAX_POINTS = 16000;
+const node = new URLSearchParams(window.location.search).get('node') || 'localhost';
+const snapshotUrl = '/api2/json/nodes/' + encodeURIComponent(node) + '/sensors';
 let refreshMs = 500;
 let fetchTimer = null;
 let activeController = null;
@@ -334,13 +336,20 @@ async function refresh() {
   activeController = controller;
   const timeout = setTimeout(() => controller.abort(), 4000);
   try {
-    const response = await fetch('./pve-sensors.json?t=' + Date.now(), {
-      cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: controller.signal,
+    const response = await fetch(snapshotUrl, {
+      cache: 'no-store', credentials: 'same-origin', referrerPolicy: 'no-referrer', signal: controller.signal,
     });
+    if (response.status === 401 || response.status === 403) {
+      const error = new Error(response.status === 401
+        ? 'Log in to Proxmox on this origin, then reload this page'
+        : 'Sys.Audit permission is required on this node');
+      error.name = 'AccessError';
+      throw error;
+    }
     if (!response.ok) throw new Error('HTTP ' + response.status);
     const raw = await response.text();
     if (raw.length > 262144) throw new Error('Sensor snapshot is too large');
-    const payload = validatePayload(JSON.parse(raw));
+    const payload = validatePayload(JSON.parse(raw).data);
     const interval = Number(payload.sample_interval_ms);
     refreshMs = Number.isFinite(interval) && interval >= 100 && interval <= 60000 ? interval : 500;
     byId('sampling').textContent = `${Math.round(refreshMs)} ms target interval`;
@@ -360,7 +369,8 @@ async function refresh() {
     }
     errorMessage = null;
   } catch (error) {
-    if (!document.hidden) errorMessage = error.name === 'AbortError' ? 'Request timed out' : 'Cannot read the sensor snapshot';
+    if (!document.hidden) errorMessage = error.name === 'AccessError' ? error.message
+      : error.name === 'AbortError' ? 'Request timed out' : 'Cannot read the sensor snapshot';
     breakNext = true;
   } finally {
     clearTimeout(timeout);

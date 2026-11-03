@@ -2,11 +2,11 @@
 
 **Live hardware temperatures in your existing Proxmox VE web server. No extra dashboard stack.**
 
-PVE Sensors Live adds a small, standalone hardware dashboard to a Proxmox VE node. A read-only Python collector polls `lm-sensors`, writes one JSON snapshot under `/run`, and lets the existing `pveproxy` HTTPS service deliver it to a plain HTML/CSS/JavaScript page. The CPU chart starts when you open the page and lives only in that browser tab.
+PVE Sensors Live adds a small, standalone hardware dashboard to a Proxmox VE node. A read-only Python collector polls `lm-sensors`, writes one JSON snapshot under `/run`, and serves it through the authenticated Proxmox API to a plain HTML/CSS/JavaScript page. The CPU chart starts when you open the page and lives only in that browser tab.
 
 **One additional APT package when needed: `lm-sensors`.** Python's standard library, systemd and Debian base utilities come from the host. There is no pip, npm, CDN, database, container, exporter stack, charting library, extra web server or new listening port.
 
-> **Read this before installing:** the page and its JSON are static resources. They are accessible **without a Proxmox login** to anyone who can reach their URL. Use a trusted management network or an appropriate access-control gateway. This is not an authenticated Proxmox plugin. The installer requires `--accept-public-data` to acknowledge that boundary.
+> **Sensor readings require a Proxmox session and `Sys.Audit` on the requested node.** The HTML/CSS/JavaScript shell remains public; measurements are available only through `GET /api2/json/nodes/{node}/sensors`. Installation removes the old public JSON route, adds one small registration to `Nodes.pm`, and reloads `pvedaemon`/`pveproxy`. Keep the management interface on a trusted network.
 
 ![Dark desktop dashboard with a CPU history chart](docs/screenshots/desktop-dark.png)
 
@@ -40,12 +40,12 @@ The intended target is a **Proxmox VE 9.x host** with systemd and Python 3.9 or 
 | `lm-sensors` and its required libraries | Installed from the host's existing APT repositories if `/usr/bin/sensors` is missing |
 | Python 3.9+ | Existing host runtime; standard library only |
 | systemd, Bash, `runuser`, `timeout`, `flock`, core utilities | Existing Proxmox/Debian base system |
-| HTTPS on port 8006 | Existing `pveproxy`; no restart or configuration change |
-| HTML, CSS, JavaScript, Python collector, unit file | Embedded in `install.sh`; also available as readable source files |
+| HTTPS and authentication | Existing `pveproxy`, Proxmox Perl API modules and session/ACL checks |
+| HTML, CSS, JavaScript, Python collector, Perl API module, unit file | Embedded in `install.sh`; also available as readable source files |
 
 The installer checks the base system instead of repairing or upgrading a damaged Proxmox installation. It does not modify repositories or disable certificate validation for package downloads. If APT has unrelated repository errors, resolve them separately.
 
-This project uses an existing static-file route, **not a supported Proxmox extension API**. Future Proxmox releases may change that behavior. The standalone routing approach has been exercised on Proxmox VE 9.x, but this generalized release has not been integration-tested across supported hardware or every Proxmox version. See [validation notes](docs/VALIDATION.md).
+The API registration is a small local patch, **not a supported Proxmox extension API**. After a `pve-manager` update, re-run the installer to reapply it. An incompatible layout stops installation; an overwritten patch makes the endpoint unavailable. Neither case exposes the JSON publicly. No automatic update hook is installed. See [validation notes](docs/VALIDATION.md) for the tests performed and the remaining live-host checks.
 
 ## Install
 
@@ -54,7 +54,7 @@ Copy the project to the Proxmox host, change into its directory, inspect the ins
 ```bash
 sha256sum -c SHA256SUMS
 less install.sh
-bash install.sh --accept-public-data
+bash install.sh
 ```
 
 `install.sh` is self-contained. Copying **only that file** is sufficient for installation; the rest of the repository is for review, documentation and development. When using the single file, compare its checksum with the release manifest before running it. A checksum detects file changes; it is not an independent signature of the publisher.
@@ -62,7 +62,7 @@ bash install.sh --accept-public-data
 For a reviewed unattended installation:
 
 ```bash
-bash install.sh --accept-public-data --yes --interval 0.5
+bash install.sh --yes --interval 0.5
 ```
 
 The installer will:
@@ -70,23 +70,23 @@ The installer will:
 1. Verify that it is running as root on a Proxmox host, and validate its embedded Python source.
 2. Install `lm-sensors` only when needed, using your existing APT repositories, `--no-install-recommends` and `--no-remove`. It displays a simulated package plan before asking for confirmation, unless `--yes` was supplied.
 3. Check sensor access with the existing `nobody` account. The actual collector uses a separate systemd dynamic identity, not this shared account.
-4. Back up this project's existing files and service state under `/var/backups/pve-sensors/`.
-5. Install the collector, its systemd unit, three static web files and a JSON symlink. It starts only `pve-sensors.service`.
-6. Wait for a fresh snapshot, verify that `www-data` can read it, and test the files over HTTPS loopback without a login cookie or API token.
+4. Remove the former public JSON link before checking patch compatibility; back up project files, `Nodes.pm` and collector service state under `/var/backups/pve-sensors/`.
+5. Install the collector, its systemd unit, web assets and `PveSensors.pm`; syntax-check the staged `Nodes.pm`, apply its marked registration and reload the Proxmox API services.
+6. Start the collector, wait for a fresh snapshot, verify local `www-data` read access, and check that HTTPS denies an anonymous API request (401) and the old static JSON URL (404).
 
-Only the project's own service is stopped or restarted on upgrade. `pveproxy`, `pvedaemon`, VMs and containers are not restarted. No stock Proxmox JavaScript or Perl file is patched. Existing unrelated collectors are not stopped automatically; stop a previous collector explicitly when replacing a different solution.
+Only the collector is stopped and started during upgrade. `pvedaemon` and `pveproxy` are reloaded to load the API registration; VMs and containers stay running. No stock Proxmox JavaScript is patched. Existing unrelated collectors are not stopped automatically.
 
 ### Open the dashboard
 
-In the browser address you normally use for this node, keep the same scheme, hostname and port 8006, and replace the path with:
+Log in to Proxmox first. In the browser address you normally use for this node, keep the same scheme, hostname and port 8006, and replace the path with:
 
 ```text
 /pve2/js/pve-sensors.html
 ```
 
-No hostname or IP address is embedded in the project. Web assets and JSON use relative URLs. A bookmark is sufficient; adding a Proxmox sidebar item is deliberately out of scope.
+No hostname or IP address is embedded in the project. Requests stay on the same origin and use the existing session cookie; passwords and API tokens are never stored. A bookmark is sufficient; the native Sensors tab is a separate task.
 
-Each node serves its **own** local measurements. Connecting to another node in a cluster does not aggregate or proxy this dashboard's data.
+The page defaults to `localhost`, suitable for `root@pam` or users with inherited permissions on `/nodes`. For an account granted `Sys.Audit` only on a specific node, append `?node=` followed by that node's Proxmox name. This uses the exact ACL path instead of `/nodes/localhost`. The API uses native node proxying for an explicitly requested cluster node; install the extension on each participating node.
 
 ### Restricted listeners
 
@@ -95,7 +95,7 @@ By default, installation verifies `https://127.0.0.1:8006`. For this **local ver
 If `pveproxy` is intentionally bound to a management address rather than loopback, inspect that setup and use:
 
 ```bash
-bash install.sh --accept-public-data --skip-http-check
+bash install.sh --skip-http-check
 ```
 
 This skips the HTTPS probe only. Filesystem permissions, collector startup and fresh JSON checks still run. Verify the page from your management browser afterward.
@@ -103,15 +103,12 @@ This skips the HTTPS probe only. Filesystem permissions, collector startup and f
 ## Architecture
 
 ```mermaid
-flowchart LR
-    H[Kernel hwmon drivers] --> L[lm-sensors]
-    L -->|sensors -j| C[Unprivileged Python collector]
-    C -->|atomic replacement| J[JSON snapshot in /run]
-    J --> S[Symlink in PVE static directory]
-    S --> P[Existing pveproxy HTTPS :8006]
-    W[Local HTML + CSS + JavaScript] --> P
-    P --> B[Browser dashboard]
-    B --> G[Canvas chart in tab memory]
+flowchart TD
+    C[Unprivileged collector] -->|atomic write| J[Snapshot in /run]
+    B[Browser session] --> A[Proxmox authentication and Sys.Audit]
+    A --> R[Read-only Sensors API]
+    J --> R
+    R --> B
 ```
 
 The collector is a single long-lived process. Each interval launches one bounded `sensors -j` read, extracts allowlisted fields, and atomically replaces the snapshot. It never starts a web server. Browser reads are handled by the web server already running on the host.
@@ -122,7 +119,8 @@ The collector is a single long-lived process. Each interval launches one bounded
 | `/etc/systemd/system/pve-sensors.service` | Hardened service definition |
 | `/etc/default/pve-sensors` | Polling interval |
 | `/run/pve-sensors/metrics.json` | Current snapshot; recreated after reboot |
-| `/usr/share/pve-manager/js/pve-sensors.json` | Symlink to the runtime snapshot |
+| `/usr/share/perl5/PVE/API2/PveSensors.pm` | Read-only authenticated snapshot endpoint |
+| `/usr/share/perl5/PVE/API2/Nodes.pm` | One marked Sensors route registration |
 | `/usr/share/pve-manager/js/pve-sensors.html` | Dashboard page |
 | `/usr/share/pve-manager/js/pve-sensors.css` | Local styling |
 | `/usr/share/pve-manager/js/pve-sensors.js` | Local rendering and chart code |
@@ -139,14 +137,14 @@ Only one read is in flight in the collector. If a read exceeds its interval, the
 
 Browser requests do not overlap. The UI follows the interval advertised in the snapshot and backs off after a request failure. It detects unchanged snapshots with a per-process random session identifier and a sequence number, so sub-second samples are not confused by second-resolution file timestamps. The session identifier is not a host identifier or credential.
 
-The chart records **snapshots observed by that tab**, not every server measurement. It cannot reconstruct observations missed during a network interruption or while the tab was hidden. Gaps are left visible. Reloading the page or selecting another CPU sensor starts a new history. When more than 16,000 points accumulate, older detail is compacted while retaining the whole time span and temperature extrema. There is no localStorage, IndexedDB, cookie, browser-to-server history upload or server database.
+The chart records **snapshots observed by that tab**, not every server measurement. It cannot reconstruct observations missed during a network interruption or while the tab was hidden. Gaps are left visible. Reloading the page or selecting another CPU sensor starts a new history. When more than 16,000 points accumulate, older detail is compacted while retaining the whole time span and temperature extrema. There is no localStorage, IndexedDB, project-created cookie, browser-to-server history upload or server database. The browser sends the existing Proxmox session cookie to the same-origin API.
 
 ### Change the interval
 
 Re-run the installer with an explicit value:
 
 ```bash
-bash install.sh --accept-public-data --interval 1
+bash install.sh --interval 1
 ```
 
 Or edit `/etc/default/pve-sensors` and restart only the collector:
@@ -197,9 +195,9 @@ That measurement does not include the additional work performed by `pveproxy` or
 
 The service uses `DynamicUser=yes`, an empty capability set, a read-only system view, private devices and temporary files, and its own network namespace. It has no TCP/UDP socket access. It can write its runtime directory, but cannot modify the installed web files. Sensor reads use a fixed subprocess argument list, not a shell command built from input.
 
-The snapshot contains temperature and fan values, sanitized category/role labels, thresholds, timestamps, collection timing and an ephemeral sequence identity. Raw sensor labels, bus addresses, serial numbers, usernames, hostname, IP addresses, CPU model names, DMI data and Proxmox credentials are not exported. Unknown inputs receive generated names. This reduces identifying information but does not make public telemetry anonymous: sensor counts and changing temperatures can still reveal hardware characteristics and workload activity.
+The snapshot contains temperature and fan values, sanitized category/role labels, thresholds, timestamps, collection timing and an ephemeral sequence identity. Raw sensor labels, bus addresses, serial numbers, usernames, hostname, IP addresses, CPU model names, DMI data and Proxmox credentials are not exported. Unknown inputs receive generated names. This reduces identifying information but does not make telemetry anonymous: sensor counts and changing temperatures can still reveal hardware characteristics and workload activity.
 
-The page uses local assets, a restrictive Content Security Policy, `textContent` for sensor names, no credentials in its JSON requests, and no analytics. It does not fetch scripts, fonts or charts from an external service. It is still JavaScript served from the Proxmox management origin, so review it as trusted code before installation.
+The page uses local assets, a restrictive Content Security Policy, `textContent` for sensor names, the existing Proxmox session for same-origin API requests, and no analytics. It does not fetch scripts, fonts or charts from an external service. It is still JavaScript served from the Proxmox management origin, so review it as trusted code before installation.
 
 No `sensors-detect`, `sensors -s`, `i2cdetect`, module loading, GPU capability changes, firewall changes or automatic updates are performed. No API token or root password is needed after installation.
 
@@ -207,7 +205,7 @@ More detail: [SECURITY.md](SECURITY.md). Scope of the publication audit: [privac
 
 ## Upgrade, remove and recover
 
-To upgrade, review a new copy of `install.sh` and run it with `--accept-public-data`. It replaces only its reserved files, preserves the polling interval, and creates a backup first. There is no background updater or post-APT patch hook.
+To upgrade, review a new copy of `install.sh` and run `bash install.sh`. The former `--accept-public-data` option is removed. The installer preserves the polling interval and backs up project files and `Nodes.pm` before replacing them. There is no background updater or post-APT patch hook.
 
 To remove:
 
@@ -215,9 +213,9 @@ To remove:
 bash install.sh --uninstall
 ```
 
-Uninstallation stops and disables `pve-sensors.service`, removes its managed files and reloads systemd's unit definitions. It leaves `lm-sensors`, required packages and backup directories installed. It does not touch Proxmox files outside the project's reserved filenames. Empty administrative directories may remain.
+Uninstallation stops and disables `pve-sensors.service`, removes project files and only the marked registration in the current `Nodes.pm`, and reloads the Proxmox API services and systemd unit definitions. It preserves unrelated upstream changes and leaves `lm-sensors` and backup directories installed.
 
-If installation fails after project files have changed, the installer attempts to restore the previous project files and active/enabled service state. **Rollback is best-effort, not transactional.** APT changes are not undone. Read the reported backup path and inspect the service state after an error.
+If installation fails after project files have changed, the installer attempts to restore the previous project files and active/enabled service state. **Rollback is best-effort, not transactional.** APT changes are not undone. The public JSON link is never restored, including when reverting an upgrade from v1. Read the reported backup path and inspect the service state after an error. Do not manually restore a v1 public JSON link.
 
 To stop polling without removing anything:
 
@@ -231,7 +229,11 @@ systemctl disable --now pve-sensors.service
 
 **CPU chart is unavailable, but other cards work.** A known CPU driver may not be exposed. Other valid channels are still shown with generic labels. Extend the classification rules and synthetic tests for additional hardware; do not guess that an arbitrary motherboard channel is the CPU.
 
-**Stale or unreachable snapshot.** Check `systemctl status pve-sensors.service --no-pager`, `journalctl -u pve-sensors.service -n 30 --no-pager`, and `readlink /usr/share/pve-manager/js/pve-sensors.json`. The agent retains the last successful snapshot after a collection failure, rather than fabricating a new timestamp.
+**Stale or unreachable snapshot.** Check `systemctl status pve-sensors.service --no-pager`, `journalctl -u pve-sensors.service -n 30 --no-pager`, and the authenticated `/api2/json/nodes/{node}/sensors` response. The agent retains the last successful snapshot after a collection failure, rather than fabricating a new timestamp.
+
+**API 401 / 403.** Log in again on the same scheme, host and port. Check `Sys.Audit` on the exact requested node; use the `?node=` query parameter for node-scoped permissions.
+
+**API unavailable after a Proxmox update.** Re-run the reviewed installer. If the patch is incompatible, leave the data private and adapt the registration; never recreate the public JSON link.
 
 **Blank page or old assets after an upgrade.** Hard-refresh the browser and inspect its developer console. Check the local static files. A future PVE change may require adapting this route; no compatibility across all future releases is guaranteed.
 
@@ -251,6 +253,7 @@ pve-sensors-live/
 │   ├── pve-sensors-agent.py    # Standard-library collector
 │   ├── pve-sensors.service     # Hardened systemd service
 │   ├── pve-sensors.defaults    # Default configuration
+│   ├── api/                    # Native API module and reversible registration
 │   └── web/                    # HTML, CSS and JavaScript
 ├── tools/                      # Installer builder and checksum generator
 ├── tests/                      # Standard-library unit tests
@@ -267,7 +270,7 @@ bash -n install.sh
 python3 tools/update_checksums.py
 ```
 
-An optional JavaScript syntax check on a development machine is `node --check src/web/pve-sensors.js`. Node.js is **not** a runtime or installation dependency and is never installed by the project.
+Optional development checks are `node --check src/web/pve-sensors.js` and `node tests/test_web.js`. The Python test suite also runs the Perl handler unit tests using core Perl modules. Node.js is **not** a runtime or installation dependency and is never installed by the project.
 
 To inspect the embedded payload without root or any package installation:
 
