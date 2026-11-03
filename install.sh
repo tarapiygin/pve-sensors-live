@@ -1320,11 +1320,15 @@ systemctl is-active --quiet "$SERVICE" || die 'The collector is not running.'
 "$RUNUSER" -u www-data -- /usr/bin/python3 -I -c \
   'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["metrics"]' "$RUNTIME"
 
+# The public path must stay absent even when HTTPS checks are skipped.
+[[ ! -e "$WEB/pve-sensors.json" && ! -L "$WEB/pve-sensors.json" ]] \
+  || die 'The public sensor JSON path still exists.'
+
 if [[ "$SKIP_HTTP" != yes ]]; then
   # Loopback only: PVE often uses a locally signed certificate. This probe
   # deliberately skips certificate verification; browser TLS is not changed.
   /usr/bin/python3 -I - "$WEB" <<'PY'
-import pathlib, ssl, sys, time, urllib.error, urllib.request
+import json, pathlib, ssl, sys, time, urllib.error, urllib.request
 root = pathlib.Path(sys.argv[1])
 context = ssl._create_unverified_context()
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1344,13 +1348,28 @@ for name in ("pve-sensors.html", "pve-sensors.css", "pve-sensors.js"):
     except Exception as exc:
         sys.exit("HTTPS loopback verification failed (" + type(exc).__name__ +
                  "). For a restricted listener, review --skip-http-check in README.md.")
-for path, expected in (("/pve2/js/pve-sensors.json", 404),
-                       ("/api2/json/nodes/localhost/sensors", 401)):
+# PVE's static-file handler can report a missing file as 500, not 404.
+# Keep the API authentication check strict and reject exposed measurements.
+for path, expected in (("/pve2/js/pve-sensors.json", (404, 500)),
+                       ("/api2/json/nodes/localhost/sensors", (401,))):
     try:
         opener.open("https://127.0.0.1:8006" + path, timeout=5).close()
     except urllib.error.HTTPError as exc:
-        if exc.code != expected:
+        with exc:
+            body = exc.read(1048577)
+        if exc.code not in expected:
             sys.exit(f"Unexpected HTTP {exc.code} for {path}; expected {expected}")
+        if len(body) > 1048576:
+            sys.exit(f"Unexpected oversized error response for {path}")
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeError):
+            payload = None
+        if isinstance(payload, dict) and (
+            "metrics" in payload or
+            isinstance(payload.get("data"), dict) and "metrics" in payload["data"]
+        ):
+            sys.exit(f"Unauthenticated response contains sensor metrics: {path}")
     else:
         sys.exit(f"Unauthenticated access unexpectedly succeeded: {path}")
 print("Local HTTPS checks passed: public snapshot absent; API requires authentication.")
