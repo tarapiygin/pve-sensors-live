@@ -54,10 +54,12 @@ The API registration, node-tab registration and script include are small local p
 Run this command in an interactive **root shell on the Proxmox VE host** (not inside a VM or container):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tarapiygin/pve-sensors-live/main/install.sh -o install.sh && bash install.sh
+curl -fsSL https://github.com/tarapiygin/pve-sensors-live/releases/latest/download/install.sh -o install.sh && bash install.sh
 ```
 
 Confirm the installer prompts. No repository clone or local build is needed. After installation, hard-refresh the Proxmox web interface and open **Node → Sensors**.
+
+The download link becomes available after the first release is published. For unreleased code, use the [installer from main](https://raw.githubusercontent.com/tarapiygin/pve-sensors-live/main/install.sh).
 
 To install from a local copy instead, copy the project to the Proxmox host, change into its directory, inspect the installer and run:
 
@@ -287,6 +289,14 @@ bash install.sh --extract ./extracted-source
 ```
 
 The extraction directory must not exist. The extracted files are identical to the corresponding source files. Do not publish host backups, terminal transcripts or real raw sensor dumps with changes. Prefer synthetic fixtures, and inspect PNG metadata before adding screenshots.
+
+### Publish a release
+
+Once the workflow is merged into `main`, open **Actions → Release → Run workflow**, select `main` and run it. No additional inputs or secrets are needed; it uses the repository's built-in `GITHUB_TOKEN`.
+
+The workflow reads `VERSION` from `src/install.template.sh`, rebuilds and tests the installer, then publishes a GitHub release such as `v2.1.0` with `install.sh` and its `SHA256SUMS`. The release points to the exact tested commit and becomes the latest release. Installation needs only `install.sh`.
+
+Existing tags and published files are never overwritten. Before the next release, update the version in the sources, rebuild `install.sh`, regenerate `SHA256SUMS` and merge the changes into `main`. If an upload fails, check for an unfinished draft release before retrying.
 
 ## License and independence
 
