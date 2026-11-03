@@ -1,5 +1,14 @@
 # Release validation
 
+## Native Sensors tab and migration (issues #2 and #3, 2.1.0)
+
+- The Python suite covers the native UI hook apply/reapply/remove paths, incompatible anchors, preservation of unrelated edits, clean/v1 migration through the actual installer helpers, rollback and uninstall. Host services and filesystem paths are stubbed or temporary.
+- `node tests/test_web.js` passes 80 assertions with synthetic ExtJS/DOM/HTTP objects: selected-node requests, session/permission errors, rendering state, 500 ms polling, no overlapping requests, panel/document visibility, hide/show abort races, destruction cleanup and independent chart histories.
+- API/UI patch applicability is checked before replacing upstream files. The standalone HTML file is no longer in the payload; both old HTML and JSON paths are removed, including on rollback.
+- The UI patches were applied, reapplied and removed against upstream `www/manager6/node/Config.js` blob `217ee284c0784e93ff14887c28fcfa43e4774e92` and `www/index.html.tpl` blob `125c1046b852bcde33b0bf6a282dbfca8b5e7f19`; removal reproduced the source exactly.
+
+These are portable tests, not a real Proxmox installation or browser rendering test. No Chromium executable or live PVE node was available. The snapshots below refer to earlier versions. Before merging, obtain third-party review. On a test PVE node, hard-refresh the interface and check Node → Sensors with node-scoped `Sys.Audit`, switch between nodes/views, check 401/403, and confirm that leaving Sensors stops requests and reopening resets its history. Test install/upgrade/reinstall/uninstall, host service reloads and cluster forwarding on the target PVE version.
+
 ## Authenticated API change (issue #1)
 
 Portable checks performed for 2.0.0:
@@ -24,10 +33,10 @@ Run the installer on a test PVE node, then check `/api2/json/nodes/{node}/sensor
 | Valid user with `Sys.Audit` only on that node | 200 with the current sanitized snapshot under `data` |
 | Same user requesting a different unauthorized node | 403; no measurements |
 | Authorized user requesting another installed cluster node | That node's snapshot, through native forwarding |
-| Old `/pve2/js/pve-sensors.json` URL, with or without a session | 404 or 500 without measurements; public file/symlink absent |
+| Old `/pve2/js/pve-sensors.json` and `/pve2/js/pve-sensors.html` URLs, with or without a session | 404 or 500 without measurements; public file/symlink absent |
 | Authorized user while the runtime snapshot is absent or invalid | Generic 503 |
 
-Confirm that reinstall succeeds, uninstall preserves unrelated `Nodes.pm` edits, and an incompatible patch does not recreate the old static link. The installer itself checks anonymous denial and removal of the public JSON URL unless `--skip-http-check` is supplied. It does not collect credentials for positive authorization tests.
+Confirm that reinstall succeeds, uninstall preserves unrelated edits in all three patched Proxmox files, and an incompatible patch does not recreate the old static link. The installer itself checks anonymous denial and removal of the public JSON URL unless `--skip-http-check` is supplied. It does not collect credentials for positive authorization tests.
 
 ## Earlier checks performed for 1.0.0
 

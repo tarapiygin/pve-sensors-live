@@ -8,7 +8,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
 umask 022
 
-VERSION=2.0.0
+VERSION=2.1.0
 WEB=/usr/share/pve-manager/js
 AGENT=/usr/local/libexec/pve-sensors-agent.py
 UNIT=/etc/systemd/system/pve-sensors.service
@@ -18,6 +18,9 @@ RUNTIME=/run/pve-sensors/metrics.json
 SERVICE=pve-sensors.service
 NODES=/usr/share/perl5/PVE/API2/Nodes.pm
 API=/usr/share/perl5/PVE/API2/PveSensors.pm
+UI_BUNDLE=$WEB/pvemanagerlib.js
+UI_TEMPLATE=/usr/share/pve-manager/index.html.tpl
+UPSTREAM=("$NODES" "$UI_BUNDLE" "$UI_TEMPLATE")
 MODE=install
 ASSUME_YES=no
 SKIP_HTTP=no
@@ -29,7 +32,7 @@ CHANGED=no
 COMMITTED=no
 OLD_ACTIVE=no
 OLD_ENABLED=no
-FILES=("$AGENT" "$UNIT" "$CONFIG" "$WEB/pve-sensors.html"
+FILES=("$AGENT" "$UNIT" "$CONFIG"
        "$WEB/pve-sensors.css" "$WEB/pve-sensors.js" "$API" "$MARKER")
 
 say() { printf '%s\n' "$*"; }
@@ -37,7 +40,7 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-PVE Sensors Live 2.0.0
+PVE Sensors Live 2.1.0
 
 Install or upgrade (run as root on the Proxmox VE host):
   bash install.sh
@@ -59,7 +62,7 @@ Options:
 
 Only lm-sensors is requested from your existing APT repositories when absent.
 Python 3.9+, systemd and Debian base utilities must already be present on PVE.
-Adds one node API registration and reloads pvedaemon/pveproxy. Guests stay running.
+Adds node API/UI hooks and reloads pvedaemon/pveproxy. Guests stay running.
 USAGE
 }
 
@@ -134,7 +137,7 @@ confirm() {
 backup_files() {
   install -d -m 0700 /var/backups/pve-sensors
   BACKUP=$(mktemp -d /var/backups/pve-sensors/backup.XXXXXXXX)
-  for file in "${FILES[@]}" "$NODES"; do
+  for file in "${FILES[@]}" "${UPSTREAM[@]}"; do
     if [[ -e "$file" || -L "$file" ]]; then
       [[ ! -d "$file" ]] || die "Refusing to replace a directory: $file"
       mkdir -p -- "$BACKUP/$(dirname "${file#/}")"
@@ -144,7 +147,7 @@ backup_files() {
   systemctl is-active --quiet "$SERVICE" && OLD_ACTIVE=yes || true
   systemctl is-enabled --quiet "$SERVICE" && OLD_ENABLED=yes || true
   printf 'active=%s\nenabled=%s\n' "$OLD_ACTIVE" "$OLD_ENABLED" > "$BACKUP/service-state.txt"
-  printf '%s\n' "${FILES[@]}" "$NODES" > "$BACKUP/managed-files.txt"
+  printf '%s\n' "${FILES[@]}" "${UPSTREAM[@]}" > "$BACKUP/managed-files.txt"
 }
 
 cleanup() {
@@ -153,14 +156,14 @@ cleanup() {
   if [[ "$CHANGED" == yes && "$COMMITTED" != yes ]]; then
     say 'Installation did not finish. Attempting to restore project files and service state.' >&2
     systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
-    for file in "${FILES[@]}" "$NODES"; do
+    for file in "${FILES[@]}" "${UPSTREAM[@]}"; do
       rm -f -- "$file" || restore_failed=yes
       if [[ -e "$BACKUP/${file#/}" || -L "$BACKUP/${file#/}" ]]; then
         cp -a -- "$BACKUP/${file#/}" "$file" || restore_failed=yes
       fi
     done
-    # Never restore the old public snapshot, even when reverting a v1 upgrade.
-    rm -f -- "$WEB/pve-sensors.json" || restore_failed=yes
+    # Never restore the old public snapshot or standalone page on rollback.
+    rm -f -- "$WEB/pve-sensors.json" "$WEB/pve-sensors.html" || restore_failed=yes
     systemctl reload pvedaemon pveproxy || restore_failed=yes
     systemctl daemon-reload || restore_failed=yes
     if [[ "$OLD_ENABLED" == yes ]]; then systemctl enable "$SERVICE" >/dev/null 2>&1 || restore_failed=yes; fi
@@ -190,15 +193,32 @@ put_file() {
   mv -fT -- "$temporary" "$destination"
 }
 
+# Prepare all patches before replacing any upstream file. Removal strips only
+# our exact blocks from the current files, preserving unrelated package edits.
+stage_patches() {
+  for file in "${UPSTREAM[@]}"; do
+    [[ -f "$file" && ! -L "$file" ]] || die "Expected a regular Proxmox file: $file"
+  done
+  /usr/bin/python3 -I "$STAGE/patch_nodes.py" "$NODES" "$STAGE/Nodes.pm" "$@"
+  /usr/bin/python3 -I "$STAGE/patch_ui.py" bundle "$UI_BUNDLE" "$STAGE/pvemanagerlib.js" "$@"
+  /usr/bin/python3 -I "$STAGE/patch_ui.py" template "$UI_TEMPLATE" "$STAGE/index.html.tpl" "$@"
+}
+
+put_patches() {
+  put_file "$STAGE/Nodes.pm" "$NODES" 0644
+  put_file "$STAGE/pvemanagerlib.js" "$UI_BUNDLE" 0644
+  put_file "$STAGE/index.html.tpl" "$UI_TEMPLATE" 0644
+}
+
 if [[ "$MODE" == uninstall ]]; then
   [[ -f "$MARKER" && ! -L "$MARKER" ]] || die 'No installation marker found; refusing to remove unowned files.'
   confirm 'Uninstall PVE Sensors Live and reload the Proxmox API services?'
-  rm -f -- "$WEB/pve-sensors.json"
-  /usr/bin/python3 -I "$STAGE/patch_nodes.py" "$NODES" "$STAGE/Nodes.pm" --remove
+  rm -f -- "$WEB/pve-sensors.json" "$WEB/pve-sensors.html"
+  stage_patches --remove
   backup_files
   CHANGED=yes
   systemctl disable --now "$SERVICE"
-  put_file "$STAGE/Nodes.pm" "$NODES" 0644
+  put_patches
   for file in "${FILES[@]}"; do rm -f -- "$file"; done
   systemctl reload pvedaemon pveproxy
   systemctl daemon-reload
@@ -210,12 +230,11 @@ if [[ "$MODE" == uninstall ]]; then
 fi
 
 say 'Sensor data requires a Proxmox session and Sys.Audit on the requested node.'
-say 'The installer patches Nodes.pm and reloads pvedaemon/pveproxy; guests stay running.'
-confirm 'Install the authenticated Sensors API?'
+say 'The installer patches Nodes.pm, pvemanagerlib.js and index.html.tpl, then reloads pvedaemon/pveproxy; guests stay running.'
+confirm 'Install the authenticated Sensors API and native tab?'
 # Revocation is intentionally outside rollback and precedes compatibility checks.
-rm -f -- "$WEB/pve-sensors.json"
-[[ -f "$NODES" && ! -L "$NODES" ]] || die 'Expected a regular Proxmox Nodes.pm.'
-/usr/bin/python3 -I "$STAGE/patch_nodes.py" "$NODES" "$STAGE/Nodes.pm"
+rm -f -- "$WEB/pve-sensors.json" "$WEB/pve-sensors.html"
+stage_patches
 
 if [[ ! -e "$MARKER" ]]; then
   for file in "${FILES[@]}"; do
@@ -293,7 +312,7 @@ install -d -m 0755 /usr/local/libexec /usr/local/share/pve-sensors
 
 put_file "$STAGE/pve-sensors-agent.py" "$AGENT" 0755
 put_file "$STAGE/pve-sensors.service" "$UNIT" 0644
-for extension in html css js; do
+for extension in css js; do
   put_file "$STAGE/pve-sensors.$extension" "$WEB/pve-sensors.$extension" 0644
 done
 # Preserve administrator comments/settings; only update the supported interval.
@@ -310,7 +329,7 @@ put_file "$STAGE/new-config" "$CONFIG" 0644
 put_file "$STAGE/PveSensors.pm" "$API" 0644
 # Compile the staged registration against the installed PVE modules before use.
 perl -T -c "$STAGE/Nodes.pm"
-put_file "$STAGE/Nodes.pm" "$NODES" 0644
+put_patches
 systemctl reload pvedaemon pveproxy
 printf '%s\n' "$VERSION" > "$STAGE/version"
 put_file "$STAGE/version" "$MARKER" 0644
@@ -335,9 +354,10 @@ systemctl is-active --quiet "$SERVICE" || die 'The collector is not running.'
 "$RUNUSER" -u www-data -- /usr/bin/python3 -I -c \
   'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["metrics"]' "$RUNTIME"
 
-# The public path must stay absent even when HTTPS checks are skipped.
-[[ ! -e "$WEB/pve-sensors.json" && ! -L "$WEB/pve-sensors.json" ]] \
-  || die 'The public sensor JSON path still exists.'
+# The public paths must stay absent even when HTTPS checks are skipped.
+for file in "$WEB/pve-sensors.json" "$WEB/pve-sensors.html"; do
+  [[ ! -e "$file" && ! -L "$file" ]] || die "Obsolete public path still exists: $file"
+done
 
 if [[ "$SKIP_HTTP" != yes ]]; then
   # Loopback only: PVE often uses a locally signed certificate. This probe
@@ -352,7 +372,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
                                     urllib.request.HTTPSHandler(context=context))
-for name in ("pve-sensors.html", "pve-sensors.css", "pve-sensors.js"):
+for name in ("pve-sensors.css", "pve-sensors.js"):
     url = "https://127.0.0.1:8006/pve2/js/" + name + "?probe=" + str(time.time_ns())
     try:
         with opener.open(url, timeout=5) as response:
@@ -366,6 +386,7 @@ for name in ("pve-sensors.html", "pve-sensors.css", "pve-sensors.js"):
 # PVE's static-file handler can report a missing file as 500, not 404.
 # Keep the API authentication check strict and reject exposed measurements.
 for path, expected in (("/pve2/js/pve-sensors.json", (404, 500)),
+                       ("/pve2/js/pve-sensors.html", (404, 500)),
                        ("/api2/json/nodes/localhost/sensors", (401,))):
     try:
         opener.open("https://127.0.0.1:8006" + path, timeout=5).close()
@@ -398,8 +419,8 @@ say ''
 say "PVE Sensors Live $VERSION installed."
 say "Collector interval: $INTERVAL seconds"
 say "Current snapshot: $RUNTIME (normally tmpfs)"
-say "Open /pve2/js/pve-sensors.html on this node's existing HTTPS :8006 origin."
+say 'Reload the Proxmox browser page, then open Node -> Sensors.'
 say 'Service: systemctl status pve-sensors.service --no-pager'
 say "Project backup: $BACKUP"
 say 'Proxmox API services were reloaded. Guests were not restarted.'
-say 'Log in to Proxmox on the same origin before opening the dashboard.'
+say 'After a pve-manager update, rerun this installer to reapply compatible hooks.'

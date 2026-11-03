@@ -18,13 +18,13 @@ class HttpProbeTests(unittest.TestCase):
     def run_probe(self, public_status=500, public_body=b'file not found', api_status=401):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in ('pve-sensors.html', 'pve-sensors.css', 'pve-sensors.js'):
+            for name in ('pve-sensors.css', 'pve-sensors.js'):
                 (root / name).write_bytes(b'asset')
 
             def open_url(url, timeout):
                 if '/api2/' in url:
                     status, body = api_status, b'no ticket'
-                elif 'pve-sensors.json' in url:
+                elif 'pve-sensors.json' in url or 'pve-sensors.html' in url:
                     if isinstance(public_status, Exception):
                         raise public_status
                     status, body = public_status, public_body
@@ -74,17 +74,19 @@ class HttpProbeTests(unittest.TestCase):
             self.run_probe(public_status=URLError('connection refused'))
 
     def test_public_file_and_dangling_symlink_are_rejected_even_when_http_is_skipped(self):
-        guard = TEMPLATE.split('# The public path must stay absent even when HTTPS checks are skipped.\n', 1)[1].split('\n\n', 1)[0]
+        guard = TEMPLATE.split('# The public paths must stay absent even when HTTPS checks are skipped.\n', 1)[1].split('\n\n', 1)[0]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            public = root / 'pve-sensors.json'
             script = 'WEB="$1"\ndie() { exit 1; }\n' + guard
             def check(expected):
                 result = subprocess.run(['bash', '-c', script, 'probe', directory], capture_output=True)
                 self.assertEqual(result.returncode, expected)
             check(0)
-            public.write_text('{}')
-            check(1)
-            public.unlink()
-            public.symlink_to(root / 'absent-metrics.json')
-            check(1)
+            for name in ('pve-sensors.json', 'pve-sensors.html'):
+                public = root / name
+                public.write_text('{}')
+                check(1)
+                public.unlink()
+                public.symlink_to(root / 'absent-file')
+                check(1)
+                public.unlink()

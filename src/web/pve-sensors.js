@@ -1,13 +1,92 @@
 /* SPDX-License-Identifier: MIT */
+/* Native node panel. Its DOM, chart history and polling belong to this instance. */
+(function () {
 'use strict';
 
-const byId = (id) => document.getElementById(id);
+const markup = `
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">°</span><span>PVE Sensors <span class="brand-muted">Live</span></span></div>
+    </div>
+  </header>
+  <main class="layout">
+    <div class="heading-row">
+      <div>
+        <p class="eyebrow">HARDWARE TELEMETRY · NO EXTRA SERVER</p>
+        <h1>Your host, a little more visible.</h1>
+        <p class="description">Live temperatures. One lightweight collector. History stays in this tab.</p>
+      </div>
+      <div class="live-block">
+        <span id="connection" class="connection pending" role="status">Connecting</span>
+        <span id="updated" class="updated">Waiting for a snapshot</span>
+      </div>
+    </div>
+    <p id="demoBanner" class="demo-banner" hidden>SIMULATED PREVIEW · Not a real host or production measurements</p>
+    <section class="hero-grid" aria-label="Primary temperatures">
+      <article class="panel hero-card">
+        <div class="hero-heading"><span class="sensor-symbol cpu-symbol">CPU</span><span id="cpuState" class="state neutral">No data</span></div>
+        <p class="metric-label">Processor temperature</p>
+        <div class="hero-value" id="cpuValue">—</div>
+        <p class="metric-subtitle" id="cpuName">Waiting for a CPU sensor</p>
+        <div class="meter" aria-hidden="true"><div id="cpuMeter" class="meter-fill neutral"></div></div>
+        <p id="cpuLimits" class="limits">Sensor thresholds are not available</p>
+      </article>
+      <article class="panel hero-card">
+        <div class="hero-heading"><span class="sensor-symbol nvme-symbol">SSD</span><span id="nvmeState" class="state neutral">No data</span></div>
+        <p class="metric-label">Storage temperature</p>
+        <div class="hero-value" id="nvmeValue">—</div>
+        <p class="metric-subtitle" id="nvmeName">Waiting for a storage sensor</p>
+        <div class="meter" aria-hidden="true"><div id="nvmeMeter" class="meter-fill neutral"></div></div>
+        <p id="nvmeLimits" class="limits">Sensor thresholds are not available</p>
+      </article>
+    </section>
+    <section class="panel chart-panel" aria-labelledby="chartTitle">
+      <div class="chart-head">
+        <div>
+          <h2 id="chartTitle">CPU temperature history</h2>
+          <p class="chart-caption"><span id="sampling">500 ms target interval</span> · Session-only history</p>
+        </div>
+        <label class="source-control">Chart source <select id="cpuSource" aria-label="CPU sensor for chart"><option value="">Waiting for sensors</option></select></label>
+      </div>
+      <div class="chart-stats" aria-label="Chart statistics">
+        <div><span>Current</span><strong id="chartCurrent">—</strong></div>
+        <div><span>Session minimum</span><strong id="chartMin">—</strong></div>
+        <div><span>Session maximum</span><strong id="chartMax">—</strong></div>
+        <div><span>Elapsed</span><strong id="chartDuration">00:00</strong></div>
+        <div><span>Unique snapshots</span><strong id="chartSamples">0</strong></div>
+      </div>
+      <div class="chart-canvas-wrap">
+        <canvas id="cpuChart" class="chart-canvas" role="img" aria-label="CPU temperature since this view was opened"></canvas>
+      </div>
+      <p id="historyNote" class="chart-footnote">Reopening the view resets history. Hidden tabs pause polling. Gaps are not invented measurements.</p>
+    </section>
+    <section class="panel section-panel">
+      <div class="section-heading"><h2>Processor sensors</h2><span class="section-note">Packages, cores and chiplets</span></div>
+      <div id="cores" class="sensor-grid"><p class="empty">Waiting for readings…</p></div>
+    </section>
+    <section class="panel section-panel">
+      <div class="section-heading"><h2>Storage &amp; other sensors</h2><span class="section-note">Read-only measurements</span></div>
+      <div id="other" class="sensor-grid"><p class="empty">Waiting for readings…</p></div>
+    </section>
+    <footer>
+      <p>Source: <code>sensors -j</code> · No telemetry · No external libraries · No server-side history</p>
+      <p>Thresholds come from the sensor, not a safety guarantee. Readings require a Proxmox session and node Sys.Audit permission.</p>
+    </footer>
+  </main>
+`;
+
+function createView(root, node) {
+const byId = (id) => root.getElementById(id);
 const numberFormat = new Intl.NumberFormat('en', { maximumFractionDigits: 1 });
 const fmt = (value) => numberFormat.format(value);
 const MAX_POINTS = 16000;
-const node = new URLSearchParams(window.location.search).get('node') || 'localhost';
 const snapshotUrl = '/api2/json/nodes/' + encodeURIComponent(node) + '/sensors';
 let refreshMs = 500;
+let panelActive = false;
+let destroyed = false;
+let statusTimer = null;
+let requestTimeout = null;
+const isRunning = () => panelActive && !document.hidden && !destroyed;
 let fetchTimer = null;
 let activeController = null;
 let loading = false;
@@ -216,7 +295,7 @@ function duration(ms) {
 }
 
 function requestChart() {
-  if (chartFrame !== null || document.hidden) return;
+  if (chartFrame !== null || !isRunning()) return;
   chartFrame = requestAnimationFrame(() => { chartFrame = null; drawChart(); });
 }
 
@@ -258,7 +337,7 @@ function drawChart() {
   }
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  const css = getComputedStyle(document.documentElement);
+  const css = getComputedStyle(root.host);
   const grid = css.getPropertyValue('--chart-grid').trim();
   const text = css.getPropertyValue('--chart-text').trim();
   const line = css.getPropertyValue('--chart-line').trim();
@@ -311,8 +390,8 @@ function updateConnection() {
   const badge = byId('connection');
   const stale = latestArrival !== null &&
     (performance.now() - latestArrival + serverAgeMs > Math.max(3000, refreshMs * 4));
-  document.body.classList.toggle('data-stale', !!errorMessage || stale);
-  if (document.hidden) {
+  root.host.classList.toggle('data-stale', !!errorMessage || stale);
+  if (!isRunning()) {
     badge.className = 'connection pending'; badge.textContent = 'Paused in background';
   } else if (errorMessage) {
     badge.className = 'connection danger'; badge.textContent = 'Connection error';
@@ -329,19 +408,21 @@ function updateConnection() {
 }
 
 async function refresh() {
-  if (loading || document.hidden) return;
+  if (loading || !isRunning()) return;
+  fetchTimer = null;
   loading = true;
   const started = performance.now();
   const controller = new AbortController();
   activeController = controller;
-  const timeout = setTimeout(() => controller.abort(), 4000);
+  let timedOut = false;
+  requestTimeout = setTimeout(() => { timedOut = true; controller.abort(); }, 4000);
   try {
     const response = await fetch(snapshotUrl, {
       cache: 'no-store', credentials: 'same-origin', referrerPolicy: 'no-referrer', signal: controller.signal,
     });
     if (response.status === 401 || response.status === 403) {
       const error = new Error(response.status === 401
-        ? 'Log in to Proxmox on this origin, then reload this page'
+        ? 'Proxmox session expired. Log in again.'
         : 'Sys.Audit permission is required on this node');
       error.name = 'AccessError';
       throw error;
@@ -349,6 +430,7 @@ async function refresh() {
     if (!response.ok) throw new Error('HTTP ' + response.status);
     const raw = await response.text();
     if (raw.length > 262144) throw new Error('Sensor snapshot is too large');
+    if (!isRunning() || controller.signal.aborted) return;
     const payload = validatePayload(JSON.parse(raw).data);
     const interval = Number(payload.sample_interval_ms);
     refreshMs = Number.isFinite(interval) && interval >= 100 && interval <= 60000 ? interval : 500;
@@ -369,38 +451,100 @@ async function refresh() {
     }
     errorMessage = null;
   } catch (error) {
-    if (!document.hidden) errorMessage = error.name === 'AccessError' ? error.message
+    if (isRunning() && (!controller.signal.aborted || timedOut)) errorMessage = error.name === 'AccessError' ? error.message
       : error.name === 'AbortError' ? 'Request timed out' : 'Cannot read the sensor snapshot';
     breakNext = true;
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(requestTimeout);
+    requestTimeout = null;
     activeController = null;
     loading = false;
+    if (destroyed) return;
     updateConnection();
     requestChart();
-    if (!document.hidden) {
+    if (isRunning()) {
       const delay = errorMessage ? Math.max(2000, refreshMs) : Math.max(50, refreshMs - (performance.now() - started));
       fetchTimer = setTimeout(refresh, delay);
     }
   }
 }
 
-byId('cpuSource').addEventListener('change', (event) => {
+function sourceChanged(event) {
   cpuId = event.target.value || null;
   resetHistory();
   const fresh = latestArrival !== null && !errorMessage &&
     performance.now() - latestArrival + serverAgeMs <= Math.max(3000, refreshMs * 4);
   if (latestPayload) render(latestPayload, fresh);
-});
-document.addEventListener('visibilitychange', () => {
+}
+
+function syncVisibility() {
+  if (destroyed) return;
   clearTimeout(fetchTimer);
-  if (document.hidden) { activeController?.abort(); breakNext = true; }
-  else if (!loading) refresh();
+  fetchTimer = null;
+  clearInterval(statusTimer);
+  statusTimer = null;
+  if (chartFrame !== null) cancelAnimationFrame(chartFrame);
+  chartFrame = null;
+  if (isRunning()) {
+    refresh();
+    statusTimer = setInterval(() => { updateConnection(); requestChart(); }, 1000);
+    requestChart();
+  } else {
+    clearTimeout(requestTimeout);
+    requestTimeout = null;
+    activeController?.abort();
+    breakNext = true;
+  }
   updateConnection();
-});
+}
+
+const theme = window.matchMedia('(prefers-color-scheme: dark)');
+byId('cpuSource').addEventListener('change', sourceChanged);
+document.addEventListener('visibilitychange', syncVisibility);
 window.addEventListener('resize', requestChart);
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', requestChart);
-window.addEventListener('pagehide', () => { clearTimeout(fetchTimer); activeController?.abort(); });
-setInterval(() => { if (!document.hidden) { updateConnection(); requestChart(); } }, 1000);
-requestChart();
-refresh();
+theme.addEventListener('change', requestChart);
+return {
+  setActive(value) { panelActive = value; syncVisibility(); },
+  resize: requestChart,
+  destroy() {
+    if (destroyed) return;
+    panelActive = false;
+    syncVisibility();
+    destroyed = true;
+    byId('cpuSource').removeEventListener('change', sourceChanged);
+    document.removeEventListener('visibilitychange', syncVisibility);
+    window.removeEventListener('resize', requestChart);
+    theme.removeEventListener('change', requestChart);
+    history = [];
+    latestPayload = null;
+  },
+};
+}
+
+Ext.define('PVE.node.Sensors', {
+  extend: 'Ext.panel.Panel',
+  alias: 'widget.pveNodeSensors',
+  bodyStyle: 'overflow:auto',
+  border: false,
+  listeners: {
+    afterrender: function () {
+      const root = this.body.dom.attachShadow({ mode: 'open' });
+      // Trusted bundled markup only; sensor strings are rendered with textContent.
+      root.innerHTML = '<link rel="stylesheet" href="/pve2/js/pve-sensors.css?v=2.1.0">' +
+        '<div class="sensors-view">' + markup + '</div>';
+      this.sensorsView = createView(root, this.nodename);
+      root.querySelector('link').addEventListener('load', () => this.sensorsView?.resize(), { once: true });
+      this.sensorsView.setActive(this.isVisible(true));
+    },
+    activate: function () { this.sensorsView?.setActive(true); },
+    deactivate: function () { this.sensorsView?.setActive(false); },
+    show: function () { this.sensorsView?.setActive(this.isVisible(true)); },
+    hide: function () { this.sensorsView?.setActive(false); },
+    resize: function () { this.sensorsView?.resize(); },
+    beforedestroy: function () {
+      this.sensorsView?.destroy();
+      this.sensorsView = null;
+    },
+  },
+});
+}());

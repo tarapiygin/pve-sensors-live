@@ -2,11 +2,13 @@
 
 **Live hardware temperatures in your existing Proxmox VE web server. No extra dashboard stack.**
 
-PVE Sensors Live adds a small, standalone hardware dashboard to a Proxmox VE node. A read-only Python collector polls `lm-sensors`, writes one JSON snapshot under `/run`, and serves it through the authenticated Proxmox API to a plain HTML/CSS/JavaScript page. The CPU chart starts when you open the page and lives only in that browser tab.
+PVE Sensors Live adds **Node → Sensors** to the existing Proxmox VE interface. A read-only Python collector polls `lm-sensors` and writes one JSON snapshot under `/run`. A small ExtJS panel reads it through the authenticated Proxmox API and displays the existing temperature cards and CPU chart. Chart history starts when the view opens and stays only in browser memory.
 
 **One additional APT package when needed: `lm-sensors`.** Python's standard library, systemd and Debian base utilities come from the host. There is no pip, npm, CDN, database, container, exporter stack, charting library, extra web server or new listening port.
 
-> **Sensor readings require a Proxmox session and `Sys.Audit` on the requested node.** The HTML/CSS/JavaScript shell remains public; measurements are available only through `GET /api2/json/nodes/{node}/sensors`. Installation removes the old public JSON route, adds one small registration to `Nodes.pm`, and reloads `pvedaemon`/`pveproxy`. Keep the management interface on a trusted network.
+> **Sensor readings require a Proxmox session and `Sys.Audit` on the requested node.** Only the project JavaScript and CSS remain public assets; measurements are available only through `GET /api2/json/nodes/{node}/sensors`. Installation removes the obsolete standalone HTML page and public JSON link, adds small API/UI hooks, and reloads `pvedaemon`/`pveproxy`. Keep the management interface on a trusted network.
+
+The screenshots below show the existing cards and chart before native-tab integration.
 
 ![Dark desktop dashboard with a CPU history chart](docs/screenshots/desktop-dark.png)
 
@@ -29,7 +31,7 @@ PVE Sensors Live adds a small, standalone hardware dashboard to a Proxmox VE nod
 - Flags stale snapshots, skips duplicate samples, handles reconnects and pauses browser polling while the tab is hidden.
 - Keeps bounded chart memory by downsampling long sessions while retaining the overall time span and extrema.
 
-It does **not** control fans, configure sensors, run automatic hardware probing, provide alert delivery, store historical measurements on the server, or add an authenticated tab to the Proxmox navigation menu.
+It does **not** control fans, configure sensors, run automatic hardware probing, provide alert delivery, store historical measurements on the server.
 
 ## Requirements and compatibility
 
@@ -41,11 +43,11 @@ The intended target is a **Proxmox VE 9.x host** with systemd and Python 3.9 or 
 | Python 3.9+ | Existing host runtime; standard library only |
 | systemd, Bash, `runuser`, `timeout`, `flock`, core utilities | Existing Proxmox/Debian base system |
 | HTTPS and authentication | Existing `pveproxy`, Proxmox Perl API modules and session/ACL checks |
-| HTML, CSS, JavaScript, Python collector, Perl API module, unit file | Embedded in `install.sh`; also available as readable source files |
+| Widget JavaScript/CSS, Python collector, Perl API module, unit file | Embedded in `install.sh`; also available as readable source files |
 
 The installer checks the base system instead of repairing or upgrading a damaged Proxmox installation. It does not modify repositories or disable certificate validation for package downloads. If APT has unrelated repository errors, resolve them separately.
 
-The API registration is a small local patch, **not a supported Proxmox extension API**. After a `pve-manager` update, re-run the installer to reapply it. An incompatible layout stops installation; an overwritten patch makes the endpoint unavailable. Neither case exposes the JSON publicly. No automatic update hook is installed. See [validation notes](docs/VALIDATION.md) for the tests performed and the remaining live-host checks.
+The API registration, node-tab registration and script include are small local patches, **not a supported Proxmox extension API**. After a `pve-manager` update, re-run the installer to reapply them. An incompatible layout stops installation; an overwritten patch makes the endpoint unavailable. Neither case exposes the JSON publicly. No automatic update hook is installed. See [validation notes](docs/VALIDATION.md) for the tests performed and the remaining live-host checks.
 
 ## Install
 
@@ -70,23 +72,19 @@ The installer will:
 1. Verify that it is running as root on a Proxmox host, and validate its embedded Python source.
 2. Install `lm-sensors` only when needed, using your existing APT repositories, `--no-install-recommends` and `--no-remove`. It displays a simulated package plan before asking for confirmation, unless `--yes` was supplied.
 3. Check sensor access with the existing `nobody` account. The actual collector uses a separate systemd dynamic identity, not this shared account.
-4. Remove the former public JSON link before checking patch compatibility; back up project files, `Nodes.pm` and collector service state under `/var/backups/pve-sensors/`.
-5. Install the collector, its systemd unit, web assets and `PveSensors.pm`; syntax-check the staged `Nodes.pm`, apply its marked registration and reload the Proxmox API services.
-6. Start the collector, wait for a fresh snapshot, verify local `www-data` read access, and check that HTTPS denies an anonymous API request (401) and the old static JSON URL (404 or 500 without measurements). The public file or symlink must also be absent, including with `--skip-http-check`.
+4. Remove the former public JSON link and standalone HTML page, then check all API/UI patch anchors before modifying Proxmox files; back up affected project files, the three patched Proxmox files and collector service state under `/var/backups/pve-sensors/`.
+5. Install the collector, its systemd unit, web assets and `PveSensors.pm`; syntax-check the staged `Nodes.pm`, apply the marked API/UI registrations and script include, then reload the Proxmox API services.
+6. Start the collector, wait for a fresh snapshot, verify local `www-data` read access, and check that HTTPS denies an anonymous API request (401) and the old static JSON URL (404 or 500 without measurements). Both obsolete public paths must be absent, including with `--skip-http-check`.
 
-Only the collector is stopped and started during upgrade. `pvedaemon` and `pveproxy` are reloaded to load the API registration; VMs and containers stay running. No stock Proxmox JavaScript is patched. Existing unrelated collectors are not stopped automatically.
+Only the collector is stopped and started during upgrade. `pvedaemon` and `pveproxy` are reloaded to load the API registration; VMs and containers stay running. The only stock JavaScript change registers the Sensors tab; its widget and chart code live in project-owned files. Existing unrelated collectors are not stopped automatically.
 
-### Open the dashboard
+### Open Sensors
 
-Log in to Proxmox first. In the browser address you normally use for this node, keep the same scheme, hostname and port 8006, and replace the path with:
+After installation, hard-refresh the Proxmox interface, sign in and select **a node → Sensors**. The tab uses that selected node automatically, including for node-scoped `Sys.Audit` permissions. No hostname, IP address, password or token is embedded in the project or URL.
 
-```text
-/pve2/js/pve-sensors.html
-```
+The panel pauses requests when hidden, aborts an in-flight request when closing, and releases its timers and event listeners when destroyed. Proxmox destroys inactive node views, so leaving and reopening Sensors starts a fresh chart. A 401 or 403 displays a session or permission error; readings never fall back to a static file.
 
-No hostname or IP address is embedded in the project. Requests stay on the same origin and use the existing session cookie; passwords and API tokens are never stored. A bookmark is sufficient; the native Sensors tab is a separate task.
-
-The page defaults to `localhost`, suitable for `root@pam` or users with inherited permissions on `/nodes`. For an account granted `Sys.Audit` only on a specific node, append `?node=` followed by that node's Proxmox name. This uses the exact ACL path instead of `/nodes/localhost`. The API uses native node proxying for an explicitly requested cluster node; install the extension on each participating node.
+For clusters, install the extension on every node where you open the UI or collect readings. The API uses Proxmox's normal forwarding to the selected node; it does not aggregate measurements.
 
 ### Restricted listeners
 
@@ -98,7 +96,7 @@ If `pveproxy` is intentionally bound to a management address rather than loopbac
 bash install.sh --skip-http-check
 ```
 
-This skips the HTTPS probe only. Filesystem permissions, collector startup and fresh JSON checks still run. Verify the page from your management browser afterward.
+This skips the HTTPS probe only. Filesystem permissions, collector startup and fresh JSON checks still run. Verify Node → Sensors from your management browser afterward.
 
 ## Architecture
 
@@ -121,7 +119,8 @@ The collector is a single long-lived process. Each interval launches one bounded
 | `/run/pve-sensors/metrics.json` | Current snapshot; recreated after reboot |
 | `/usr/share/perl5/PVE/API2/PveSensors.pm` | Read-only authenticated snapshot endpoint |
 | `/usr/share/perl5/PVE/API2/Nodes.pm` | One marked Sensors route registration |
-| `/usr/share/pve-manager/js/pve-sensors.html` | Dashboard page |
+| `/usr/share/pve-manager/js/pvemanagerlib.js` | Marked node-tab registration |
+| `/usr/share/pve-manager/index.html.tpl` | Marked include for the project widget script |
 | `/usr/share/pve-manager/js/pve-sensors.css` | Local styling |
 | `/usr/share/pve-manager/js/pve-sensors.js` | Local rendering and chart code |
 | `/usr/local/share/pve-sensors/installed-version` | Ownership/version marker for upgrades and removal |
@@ -197,7 +196,7 @@ The service uses `DynamicUser=yes`, an empty capability set, a read-only system 
 
 The snapshot contains temperature and fan values, sanitized category/role labels, thresholds, timestamps, collection timing and an ephemeral sequence identity. Raw sensor labels, bus addresses, serial numbers, usernames, hostname, IP addresses, CPU model names, DMI data and Proxmox credentials are not exported. Unknown inputs receive generated names. This reduces identifying information but does not make telemetry anonymous: sensor counts and changing temperatures can still reveal hardware characteristics and workload activity.
 
-The page uses local assets, a restrictive Content Security Policy, `textContent` for sensor names, the existing Proxmox session for same-origin API requests, and no analytics. It does not fetch scripts, fonts or charts from an external service. It is still JavaScript served from the Proxmox management origin, so review it as trusted code before installation.
+The native panel uses local assets, Shadow DOM for style isolation, `textContent` for sensor names, the existing Proxmox session for same-origin API requests, and no analytics. It does not fetch scripts, fonts or charts from an external service. It is still JavaScript served from the Proxmox management origin, so review it as trusted code before installation.
 
 No `sensors-detect`, `sensors -s`, `i2cdetect`, module loading, GPU capability changes, firewall changes or automatic updates are performed. No API token or root password is needed after installation.
 
@@ -205,7 +204,7 @@ More detail: [SECURITY.md](SECURITY.md). Scope of the publication audit: [privac
 
 ## Upgrade, remove and recover
 
-To upgrade, review a new copy of `install.sh` and run `bash install.sh`. The former `--accept-public-data` option is removed. The installer preserves the polling interval and backs up project files and `Nodes.pm` before replacing them. There is no background updater or post-APT patch hook.
+To upgrade, review a new copy of `install.sh` and run `bash install.sh`. The former `--accept-public-data` option is removed. The installer preserves the polling interval and backs up affected files before replacing them. Upgrades from v1 and the API-only v2 remove both `pve-sensors.html` and `pve-sensors.json`; the old bookmark no longer opens a dashboard. There is no background updater or post-APT patch hook.
 
 To remove:
 
@@ -213,9 +212,9 @@ To remove:
 bash install.sh --uninstall
 ```
 
-Uninstallation stops and disables `pve-sensors.service`, removes project files and only the marked registration in the current `Nodes.pm`, and reloads the Proxmox API services and systemd unit definitions. It preserves unrelated upstream changes and leaves `lm-sensors` and backup directories installed.
+Uninstallation stops and disables `pve-sensors.service`, removes project files and only the marked API/UI hooks in the current `Nodes.pm`, `pvemanagerlib.js` and `index.html.tpl`, and reloads the Proxmox API services and systemd unit definitions. It preserves unrelated upstream changes and leaves `lm-sensors` and backup directories installed.
 
-If installation fails after project files have changed, the installer attempts to restore the previous project files and active/enabled service state. **Rollback is best-effort, not transactional.** APT changes are not undone. The public JSON link is never restored, including when reverting an upgrade from v1. Read the reported backup path and inspect the service state after an error. Do not manually restore a v1 public JSON link.
+If installation fails after project files have changed, the installer attempts to restore the previous project files and active/enabled service state. **Rollback is best-effort, not transactional.** APT changes are not undone. Neither the public JSON link nor the obsolete HTML page is restored, including when reverting an upgrade from v1. Read the reported backup path and inspect the service state after an error. Do not manually restore a v1 public JSON link.
 
 To stop polling without removing anything:
 
@@ -231,7 +230,7 @@ systemctl disable --now pve-sensors.service
 
 **Stale or unreachable snapshot.** Check `systemctl status pve-sensors.service --no-pager`, `journalctl -u pve-sensors.service -n 30 --no-pager`, and the authenticated `/api2/json/nodes/{node}/sensors` response. The agent retains the last successful snapshot after a collection failure, rather than fabricating a new timestamp.
 
-**API 401 / 403.** Log in again on the same scheme, host and port. Check `Sys.Audit` on the exact requested node; use the `?node=` query parameter for node-scoped permissions.
+**API 401 / 403.** Log in again on the same scheme, host and port. Check `Sys.Audit` on the exact requested node; the tab uses the selected node, not the `localhost` alias.
 
 **API unavailable after a Proxmox update.** Re-run the reviewed installer. If the patch is incompatible, leave the data private and adapt the registration; never recreate the public JSON link.
 
@@ -254,7 +253,8 @@ pve-sensors-live/
 │   ├── pve-sensors.service     # Hardened systemd service
 │   ├── pve-sensors.defaults    # Default configuration
 │   ├── api/                    # Native API module and reversible registration
-│   └── web/                    # HTML, CSS and JavaScript
+│   ├── ui/                     # Reversible native-tab and script hooks
+│   └── web/                    # Widget, cards, chart and scoped CSS
 ├── tools/                      # Installer builder and checksum generator
 ├── tests/                      # Standard-library unit tests
 └── docs/                       # Screenshots and release validation notes
@@ -295,3 +295,6 @@ These links document the platform behavior used by the implementation; they are 
 - [Debian lm-sensors package](https://packages.debian.org/trixie/lm-sensors)
 - [systemd execution sandbox and runtime directories](https://www.freedesktop.org/software/systemd/man/systemd.exec.html)
 - [Linux hwmon sensor access and update intervals](https://www.kernel.org/doc/html/latest/hwmon/sysfs-interface.html)
+
+- [Proxmox UI template and script load order](https://github.com/proxmox/pve-manager/blob/master/www/index.html.tpl)
+- [Proxmox node configuration panel](https://github.com/proxmox/pve-manager/blob/master/www/manager6/node/Config.js)

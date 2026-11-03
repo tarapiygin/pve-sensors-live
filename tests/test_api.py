@@ -64,13 +64,20 @@ class MigrationTests(unittest.TestCase):
             root = Path(directory)
             nodes = root / 'Nodes.pm'
             agent = root / 'agent.py'
+            bundle = root / 'pvemanagerlib.js'
+            template = root / 'index.html.tpl'
+            bundle.write_text('original bundle')
+            template.write_text('original template')
             nodes.write_text(NODES)
             agent.write_text('old agent')
             (root / 'pve-sensors.json').symlink_to(root / 'metrics.json')
+            (root / 'pve-sensors.html').write_text('old public page')
             functions = functions.replace('/var/backups/pve-sensors', str(root / 'backups'))
             script = f"""set -euo pipefail
 WEB={shlex.quote(directory)}
 NODES="$WEB/Nodes.pm"
+UI_BUNDLE="$WEB/pvemanagerlib.js" UI_TEMPLATE="$WEB/index.html.tpl"
+UPSTREAM=("$NODES" "$UI_BUNDLE" "$UI_TEMPLATE")
 SERVICE=pve-sensors.service
 FILES=("$WEB/agent.py")
 OLD_ACTIVE=no OLD_ENABLED=no CHANGED=no COMMITTED=no STAGE=
@@ -81,6 +88,8 @@ systemctl() {{ return 0; }}
 backup_files
 CHANGED=yes
 printf changed > "$NODES"
+printf changed > "$UI_BUNDLE"
+printf changed > "$UI_TEMPLATE"
 printf changed > "$WEB/agent.py"
 trap cleanup EXIT
 exit 17
@@ -88,17 +97,23 @@ exit 17
             result = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
             self.assertEqual(result.returncode, 17, result.stderr)
             self.assertEqual(nodes.read_text(), NODES)
+            self.assertEqual(bundle.read_text(), 'original bundle')
+            self.assertEqual(template.read_text(), 'original template')
             self.assertEqual(agent.read_text(), 'old agent')
             self.assertFalse((root / 'pve-sensors.json').is_symlink())
+            self.assertFalse((root / 'pve-sensors.html').exists())
 
     def test_incompatible_upgrade_revokes_public_link_before_patch_failure(self):
         source = (ROOT / 'src/install.template.sh').read_text()
+        helper_start = source.index('stage_patches() {')
+        helpers = source[helper_start:source.index('put_patches() {')]
         start = source.index("# Revocation is intentionally")
         end = source.index('if [[ ! -e "$MARKER" ]]', start)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'Nodes.pm').write_text('unsupported upstream')
             (root / 'pve-sensors.json').symlink_to(root / 'metrics.json')
+            (root / 'pve-sensors.html').write_text('old public page')
             # The patcher writes only on success, so use a separate stage.
             stage = root / 'stage'
             stage.mkdir()
@@ -106,8 +121,11 @@ exit 17
             script = f"""set -euo pipefail
 WEB={shlex.quote(directory)}
 NODES="$WEB/Nodes.pm"
+UI_BUNDLE="$NODES" UI_TEMPLATE="$NODES"
+UPSTREAM=("$NODES")
 STAGE="$WEB/stage"
 die() {{ exit 1; }}
+{helpers}
 {source[start:end]}
 """
             result = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
@@ -115,3 +133,4 @@ die() {{ exit 1; }}
             self.assertIn('Unsupported Nodes.pm', result.stderr)
             self.assertEqual((root / 'Nodes.pm').read_text(), 'unsupported upstream')
             self.assertFalse((root / 'pve-sensors.json').is_symlink())
+            self.assertFalse((root / 'pve-sensors.html').exists())
