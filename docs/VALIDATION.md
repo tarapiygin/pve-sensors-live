@@ -4,8 +4,9 @@
 
 Portable checks performed for 2.0.0:
 
-- 32 Python tests pass, including the 16-assertion Perl handler harness.
+- 40 Python tests pass, including the 16-assertion Perl handler harness.
 - The handler tests verify the native node-scoped permission declaration, GET-only registration, node proxying, fixed snapshot path, current data and generic errors. PVE module boundaries are stubbed; these are not real ticket/ACL tests.
+- Installer HTTP probe tests accept missing-file 404/500 responses, reject measurements even in an error body, keep API denial at 401, and reject network failures, successful public responses and surviving files or dangling symlinks.
 - Migration tests exercise the installer's rollback functions and incompatible-patch path in temporary directories: project files are restored and the public JSON link stays removed.
 - Patch apply/reapply/remove tests preserve unrelated changes and reject conflicting routes or modified markers. Apply/remove was also checked against the upstream `Nodes.pm` blob `df0b2c2d90b19bde1be069cda523eb58454d8913` from `proxmox/pve-manager`.
 - JavaScript transport tests cover the API `data` envelope, same-origin credentials, 401/403/503 and absence of a public fallback. Bash/JavaScript syntax and installer payload equivalence pass.
@@ -23,7 +24,7 @@ Run the installer on a test PVE node, then check `/api2/json/nodes/{node}/sensor
 | Valid user with `Sys.Audit` only on that node | 200 with the current sanitized snapshot under `data` |
 | Same user requesting a different unauthorized node | 403; no measurements |
 | Authorized user requesting another installed cluster node | That node's snapshot, through native forwarding |
-| Old `/pve2/js/pve-sensors.json` URL, with or without a session | 404 |
+| Old `/pve2/js/pve-sensors.json` URL, with or without a session | 404 or 500 without measurements; public file/symlink absent |
 | Authorized user while the runtime snapshot is absent or invalid | Generic 503 |
 
 Confirm that reinstall succeeds, uninstall preserves unrelated `Nodes.pm` edits, and an incompatible patch does not recreate the old static link. The installer itself checks anonymous denial and removal of the public JSON URL unless `--skip-http-check` is supplied. It does not collect credentials for positive authorization tests.

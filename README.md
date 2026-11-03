@@ -72,7 +72,7 @@ The installer will:
 3. Check sensor access with the existing `nobody` account. The actual collector uses a separate systemd dynamic identity, not this shared account.
 4. Remove the former public JSON link before checking patch compatibility; back up project files, `Nodes.pm` and collector service state under `/var/backups/pve-sensors/`.
 5. Install the collector, its systemd unit, web assets and `PveSensors.pm`; syntax-check the staged `Nodes.pm`, apply its marked registration and reload the Proxmox API services.
-6. Start the collector, wait for a fresh snapshot, verify local `www-data` read access, and check that HTTPS denies an anonymous API request (401) and the old static JSON URL (404).
+6. Start the collector, wait for a fresh snapshot, verify local `www-data` read access, and check that HTTPS denies an anonymous API request (401) and the old static JSON URL (404 or 500 without measurements). The public file or symlink must also be absent, including with `--skip-http-check`.
 
 Only the collector is stopped and started during upgrade. `pvedaemon` and `pveproxy` are reloaded to load the API registration; VMs and containers stay running. No stock Proxmox JavaScript is patched. Existing unrelated collectors are not stopped automatically.
 
