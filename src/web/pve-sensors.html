@@ -8,8 +8,8 @@
   <meta name="referrer" content="no-referrer">
   <meta name="color-scheme" content="dark light">
   <title>PVE Sensors Live | Hardware temperatures</title>
-  <link rel="stylesheet" href="./pve-sensors.css?v=1.0.0">
-  <script src="./pve-sensors.js?v=1.0.0" defer></script>
+  <link rel="stylesheet" href="./pve-sensors.css?v=2.0.0">
+  <script src="./pve-sensors.js?v=2.0.0" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -80,7 +80,7 @@
     </section>
     <footer>
       <p>Source: <code>sensors -j</code> · No telemetry · No external libraries · No server-side history</p>
-      <p>Thresholds come from the sensor, not a safety guarantee. This static dashboard does not require a Proxmox login.</p>
+      <p>Thresholds come from the sensor, not a safety guarantee. Readings require a Proxmox session and node Sys.Audit permission.</p>
     </footer>
   </main>
 </body>

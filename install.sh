@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: MIT
 # PVE Sensors Live: a self-contained, auditable installer.
 # All runtime source files are embedded as plain-text heredocs below.
-# No remote script execution, source downloads, repository edits, or PVE patches.
+# No remote script execution, source downloads, repository edits, or extra listeners.
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
 umask 022
 
-VERSION=1.0.0
+VERSION=2.0.0
 WEB=/usr/share/pve-manager/js
 AGENT=/usr/local/libexec/pve-sensors-agent.py
 UNIT=/etc/systemd/system/pve-sensors.service
@@ -16,9 +16,10 @@ CONFIG=/etc/default/pve-sensors
 MARKER=/usr/local/share/pve-sensors/installed-version
 RUNTIME=/run/pve-sensors/metrics.json
 SERVICE=pve-sensors.service
+NODES=/usr/share/perl5/PVE/API2/Nodes.pm
+API=/usr/share/perl5/PVE/API2/PveSensors.pm
 MODE=install
 ASSUME_YES=no
-ACCEPT_PUBLIC=no
 SKIP_HTTP=no
 INTERVAL=
 EXTRACT_DIR=
@@ -29,18 +30,18 @@ COMMITTED=no
 OLD_ACTIVE=no
 OLD_ENABLED=no
 FILES=("$AGENT" "$UNIT" "$CONFIG" "$WEB/pve-sensors.html"
-       "$WEB/pve-sensors.css" "$WEB/pve-sensors.js" "$WEB/pve-sensors.json" "$MARKER")
+       "$WEB/pve-sensors.css" "$WEB/pve-sensors.js" "$API" "$MARKER")
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-PVE Sensors Live 1.0.0
+PVE Sensors Live 2.0.0
 
 Install or upgrade (run as root on the Proxmox VE host):
-  bash install.sh --accept-public-data
-  bash install.sh --accept-public-data --yes --interval 0.5
+  bash install.sh
+  bash install.sh --yes --interval 0.5
 
 Other operations:
   bash install.sh --status
@@ -50,8 +51,7 @@ Other operations:
   bash install.sh --help
 
 Options:
-  --accept-public-data  Acknowledge that HTML and JSON are served WITHOUT LOGIN.
-  --yes                 Accept the displayed package/removal confirmation.
+  --yes                 Accept the displayed installation/removal confirmations.
   --interval SECONDS    Poll interval: 0.1 to 60; default 0.5; preserve on upgrade.
   --skip-http-check     Skip only the HTTPS loopback test (restricted listeners).
   --extract DIRECTORY   Extract embedded sources only, without root or changes
@@ -59,7 +59,7 @@ Options:
 
 Only lm-sensors is requested from your existing APT repositories when absent.
 Python 3.9+, systemd and Debian base utilities must already be present on PVE.
-This installer never changes PVE source code, restarts pveproxy or stops guests.
+Adds one node API registration and reloads pvedaemon/pveproxy. Guests stay running.
 USAGE
 }
 
@@ -72,7 +72,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h) usage; exit 0 ;;
     --yes|-y) ASSUME_YES=yes; shift ;;
-    --accept-public-data) ACCEPT_PUBLIC=yes; shift ;;
     --skip-http-check) SKIP_HTTP=yes; shift ;;
     --interval)
       [[ $# -ge 2 ]] || die '--interval requires a value.'
@@ -88,7 +87,102 @@ done
 
 write_payload() {
   local target="$1"
-  cat > "$target/pve-sensors-agent.py" <<'PVE_SENSORS_EMBEDDED_FILE_1_END'
+  cat > "$target/PveSensors.pm" <<'PVE_SENSORS_EMBEDDED_FILE_1_END'
+# SPDX-License-Identifier: MIT
+package PVE::API2::PveSensors;
+
+use strict;
+use warnings;
+use JSON::PP qw(decode_json);
+use PVE::Exception qw(raise);
+use PVE::JSONSchema qw(get_standard_option);
+use PVE::Tools qw(file_get_contents);
+use base qw(PVE::RESTHandler);
+
+__PACKAGE__->register_method({
+    name => 'snapshot',
+    path => '',
+    method => 'GET',
+    description => 'Read the sanitized PVE Sensors Live snapshot.',
+    proxyto => 'node',
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => { node => get_standard_option('pve-node') },
+    },
+    returns => { type => 'object', additionalProperties => 1 },
+    code => sub {
+        # Collection and sanitization stay in the unprivileged agent. Never run
+        # sensors, accept a filesystem path, or return raw read/decode errors.
+        my $snapshot = eval {
+            decode_json(file_get_contents('/run/pve-sensors/metrics.json'));
+        };
+        raise('Sensor snapshot unavailable', code => 503)
+            if $@ || ref($snapshot) ne 'HASH' || ref($snapshot->{metrics}) ne 'ARRAY';
+        return $snapshot;
+    },
+});
+
+1;
+PVE_SENSORS_EMBEDDED_FILE_1_END
+  cat > "$target/patch_nodes.py" <<'PVE_SENSORS_EMBEDDED_FILE_2_END'
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Add/remove one marked registration in Proxmox's node API; no update hooks."""
+import argparse
+import re
+from pathlib import Path
+
+BEGIN = "# BEGIN PVE SENSORS LIVE\n"
+END = "# END PVE SENSORS LIVE\n"
+BLOCK = BEGIN + """use PVE::API2::PveSensors;
+__PACKAGE__->register_method({
+    subclass => 'PVE::API2::PveSensors',
+    path => 'sensors',
+});
+""" + END
+
+
+def patch(text, remove=False):
+    if BEGIN in text or END in text:
+        if text.count(BEGIN) != 1 or text.count(END) != 1 or BLOCK not in text:
+            raise ValueError("Changed Sensors registration; review Nodes.pm manually")
+        text = text.replace(BLOCK, "", 1)
+    if remove:
+        return text
+    # Scope the anchor to Nodeinfo, not the second package in Nodes.pm.
+    package = "package PVE::API2::Nodes::Nodeinfo;"
+    if text.count(package) != 1:
+        raise ValueError("Unsupported Nodes.pm: Nodeinfo package not found uniquely")
+    start = text.index(package) + len(package)
+    end = text.find("\npackage ", start)
+    end = len(text) if end == -1 else end
+    section = text[start:end]
+    anchor = "use base qw(PVE::RESTHandler);\n"
+    if section.count(anchor) != 1 or re.search(r"path\s*=>\s*['\"]sensors['\"]", section):
+        raise ValueError("Unsupported Nodes.pm: ambiguous anchor or sensors route already exists")
+    return text[:start] + section.replace(anchor, anchor + BLOCK, 1) + text[end:]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", type=Path)
+    parser.add_argument("destination", type=Path)
+    parser.add_argument("--remove", action="store_true")
+    args = parser.parse_args()
+    try:
+        result = patch(args.source.read_text(), args.remove)
+    except ValueError as exc:
+        parser.exit(1, f"{exc}\n")
+    args.destination.write_text(result)
+
+
+if __name__ == "__main__":
+    main()
+PVE_SENSORS_EMBEDDED_FILE_2_END
+  cat > "$target/pve-sensors-agent.py" <<'PVE_SENSORS_EMBEDDED_FILE_3_END'
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """Read lm-sensors without privileges and atomically publish allowlisted metrics.
@@ -113,7 +207,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 SENSORS = "/usr/bin/sensors"
 DEFAULT_OUTPUT = Path("/run/pve-sensors/metrics.json")
 READ_TIMEOUT = 2.0
@@ -334,8 +428,8 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-PVE_SENSORS_EMBEDDED_FILE_1_END
-  cat > "$target/pve-sensors.service" <<'PVE_SENSORS_EMBEDDED_FILE_2_END'
+PVE_SENSORS_EMBEDDED_FILE_3_END
+  cat > "$target/pve-sensors.service" <<'PVE_SENSORS_EMBEDDED_FILE_4_END'
 # SPDX-License-Identifier: MIT
 [Unit]
 Description=PVE Sensors Live - unprivileged hardware sensor collector
@@ -380,15 +474,15 @@ TasksMax=16
 
 [Install]
 WantedBy=multi-user.target
-PVE_SENSORS_EMBEDDED_FILE_2_END
-  cat > "$target/pve-sensors.defaults" <<'PVE_SENSORS_EMBEDDED_FILE_3_END'
+PVE_SENSORS_EMBEDDED_FILE_4_END
+  cat > "$target/pve-sensors.defaults" <<'PVE_SENSORS_EMBEDDED_FILE_5_END'
 # SPDX-License-Identifier: MIT
 # Poll interval in seconds: 0.1 to 60. Default: 0.5 (two reads per second).
 # Faster polling does not make the hardware sensor update faster.
 # Restart only pve-sensors.service after editing this file.
 PVE_SENSORS_INTERVAL=0.5
-PVE_SENSORS_EMBEDDED_FILE_3_END
-  cat > "$target/pve-sensors.html" <<'PVE_SENSORS_EMBEDDED_FILE_4_END'
+PVE_SENSORS_EMBEDDED_FILE_5_END
+  cat > "$target/pve-sensors.html" <<'PVE_SENSORS_EMBEDDED_FILE_6_END'
 <!doctype html>
 <!-- SPDX-License-Identifier: MIT -->
 <html lang="en">
@@ -399,8 +493,8 @@ PVE_SENSORS_EMBEDDED_FILE_3_END
   <meta name="referrer" content="no-referrer">
   <meta name="color-scheme" content="dark light">
   <title>PVE Sensors Live | Hardware temperatures</title>
-  <link rel="stylesheet" href="./pve-sensors.css?v=1.0.0">
-  <script src="./pve-sensors.js?v=1.0.0" defer></script>
+  <link rel="stylesheet" href="./pve-sensors.css?v=2.0.0">
+  <script src="./pve-sensors.js?v=2.0.0" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -471,13 +565,13 @@ PVE_SENSORS_EMBEDDED_FILE_3_END
     </section>
     <footer>
       <p>Source: <code>sensors -j</code> · No telemetry · No external libraries · No server-side history</p>
-      <p>Thresholds come from the sensor, not a safety guarantee. This static dashboard does not require a Proxmox login.</p>
+      <p>Thresholds come from the sensor, not a safety guarantee. Readings require a Proxmox session and node Sys.Audit permission.</p>
     </footer>
   </main>
 </body>
 </html>
-PVE_SENSORS_EMBEDDED_FILE_4_END
-  cat > "$target/pve-sensors.css" <<'PVE_SENSORS_EMBEDDED_FILE_5_END'
+PVE_SENSORS_EMBEDDED_FILE_6_END
+  cat > "$target/pve-sensors.css" <<'PVE_SENSORS_EMBEDDED_FILE_7_END'
 /* SPDX-License-Identifier: MIT */
 :root{color-scheme:dark light;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#111827;color:#eef2f7}
 *{box-sizing:border-box}
@@ -570,8 +664,8 @@ body.data-stale .hero-value,body.data-stale .sensor-value{opacity:.55}
 @media(max-width:560px){.source-control{width:100%}.section-heading{flex-wrap:wrap}.description{max-width:34em}.chart-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.topbar-inner{gap:8px}.brand{font-size:14px}.back-link{font-size:12px;padding:8px 0}}
 @media(prefers-color-scheme:light){select{background:#fff;border-color:#cad6e4;color:#23394f}.source-control{color:#607185}.demo-banner{background:#fff5dd;color:#7a5411;border-color:#edd7a9}}
 @media(prefers-reduced-motion:reduce){.meter-fill{transition:none}}
-PVE_SENSORS_EMBEDDED_FILE_5_END
-  cat > "$target/pve-sensors.js" <<'PVE_SENSORS_EMBEDDED_FILE_6_END'
+PVE_SENSORS_EMBEDDED_FILE_7_END
+  cat > "$target/pve-sensors.js" <<'PVE_SENSORS_EMBEDDED_FILE_8_END'
 /* SPDX-License-Identifier: MIT */
 'use strict';
 
@@ -579,6 +673,8 @@ const byId = (id) => document.getElementById(id);
 const numberFormat = new Intl.NumberFormat('en', { maximumFractionDigits: 1 });
 const fmt = (value) => numberFormat.format(value);
 const MAX_POINTS = 16000;
+const node = new URLSearchParams(window.location.search).get('node') || 'localhost';
+const snapshotUrl = '/api2/json/nodes/' + encodeURIComponent(node) + '/sensors';
 let refreshMs = 500;
 let fetchTimer = null;
 let activeController = null;
@@ -908,13 +1004,20 @@ async function refresh() {
   activeController = controller;
   const timeout = setTimeout(() => controller.abort(), 4000);
   try {
-    const response = await fetch('./pve-sensors.json?t=' + Date.now(), {
-      cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: controller.signal,
+    const response = await fetch(snapshotUrl, {
+      cache: 'no-store', credentials: 'same-origin', referrerPolicy: 'no-referrer', signal: controller.signal,
     });
+    if (response.status === 401 || response.status === 403) {
+      const error = new Error(response.status === 401
+        ? 'Log in to Proxmox on this origin, then reload this page'
+        : 'Sys.Audit permission is required on this node');
+      error.name = 'AccessError';
+      throw error;
+    }
     if (!response.ok) throw new Error('HTTP ' + response.status);
     const raw = await response.text();
     if (raw.length > 262144) throw new Error('Sensor snapshot is too large');
-    const payload = validatePayload(JSON.parse(raw));
+    const payload = validatePayload(JSON.parse(raw).data);
     const interval = Number(payload.sample_interval_ms);
     refreshMs = Number.isFinite(interval) && interval >= 100 && interval <= 60000 ? interval : 500;
     byId('sampling').textContent = `${Math.round(refreshMs)} ms target interval`;
@@ -934,7 +1037,8 @@ async function refresh() {
     }
     errorMessage = null;
   } catch (error) {
-    if (!document.hidden) errorMessage = error.name === 'AbortError' ? 'Request timed out' : 'Cannot read the sensor snapshot';
+    if (!document.hidden) errorMessage = error.name === 'AccessError' ? error.message
+      : error.name === 'AbortError' ? 'Request timed out' : 'Cannot read the sensor snapshot';
     breakNext = true;
   } finally {
     clearTimeout(timeout);
@@ -968,7 +1072,7 @@ window.addEventListener('pagehide', () => { clearTimeout(fetchTimer); activeCont
 setInterval(() => { if (!document.hidden) { updateConnection(); requestChart(); } }, 1000);
 requestChart();
 refresh();
-PVE_SENSORS_EMBEDDED_FILE_6_END
+PVE_SENSORS_EMBEDDED_FILE_8_END
 }
 
 if [[ "$MODE" == extract ]]; then
@@ -986,7 +1090,7 @@ if [[ "$MODE" == status ]]; then
 fi
 
 [[ "$EUID" -eq 0 ]] || die 'Run as root on the Proxmox VE host, not in a VM or container.'
-for cmd in systemctl dpkg-query install mktemp cp mv ln rm mkdir flock; do
+for cmd in systemctl dpkg-query install mktemp cp mv rm mkdir flock perl; do
   command -v "$cmd" >/dev/null || die "Required base utility is missing: $cmd"
 done
 [[ -d /run/systemd/system ]] || die 'A booted systemd host is required.'
@@ -1015,7 +1119,7 @@ confirm() {
 backup_files() {
   install -d -m 0700 /var/backups/pve-sensors
   BACKUP=$(mktemp -d /var/backups/pve-sensors/backup.XXXXXXXX)
-  for file in "${FILES[@]}"; do
+  for file in "${FILES[@]}" "$NODES"; do
     if [[ -e "$file" || -L "$file" ]]; then
       [[ ! -d "$file" ]] || die "Refusing to replace a directory: $file"
       mkdir -p -- "$BACKUP/$(dirname "${file#/}")"
@@ -1025,7 +1129,7 @@ backup_files() {
   systemctl is-active --quiet "$SERVICE" && OLD_ACTIVE=yes || true
   systemctl is-enabled --quiet "$SERVICE" && OLD_ENABLED=yes || true
   printf 'active=%s\nenabled=%s\n' "$OLD_ACTIVE" "$OLD_ENABLED" > "$BACKUP/service-state.txt"
-  printf '%s\n' "${FILES[@]}" > "$BACKUP/managed-files.txt"
+  printf '%s\n' "${FILES[@]}" "$NODES" > "$BACKUP/managed-files.txt"
 }
 
 cleanup() {
@@ -1034,12 +1138,15 @@ cleanup() {
   if [[ "$CHANGED" == yes && "$COMMITTED" != yes ]]; then
     say 'Installation did not finish. Attempting to restore project files and service state.' >&2
     systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
-    for file in "${FILES[@]}"; do
+    for file in "${FILES[@]}" "$NODES"; do
       rm -f -- "$file" || restore_failed=yes
       if [[ -e "$BACKUP/${file#/}" || -L "$BACKUP/${file#/}" ]]; then
         cp -a -- "$BACKUP/${file#/}" "$file" || restore_failed=yes
       fi
     done
+    # Never restore the old public snapshot, even when reverting a v1 upgrade.
+    rm -f -- "$WEB/pve-sensors.json" || restore_failed=yes
+    systemctl reload pvedaemon pveproxy || restore_failed=yes
     systemctl daemon-reload || restore_failed=yes
     if [[ "$OLD_ENABLED" == yes ]]; then systemctl enable "$SERVICE" >/dev/null 2>&1 || restore_failed=yes; fi
     if [[ "$OLD_ACTIVE" == yes ]]; then systemctl start "$SERVICE" || restore_failed=yes; fi
@@ -1057,25 +1164,43 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+STAGE=$(mktemp -d /tmp/pve-sensors-install.XXXXXXXX)
+chmod 0700 "$STAGE"
+write_payload "$STAGE"
+
+put_file() {
+  local source="$1" destination="$2" mode="$3" temporary
+  temporary=$(mktemp "$(dirname "$destination")/.pve-sensors-install.XXXXXXXX")
+  install -m "$mode" -- "$source" "$temporary"
+  mv -fT -- "$temporary" "$destination"
+}
+
 if [[ "$MODE" == uninstall ]]; then
   [[ -f "$MARKER" && ! -L "$MARKER" ]] || die 'No installation marker found; refusing to remove unowned files.'
-  say 'This removes only PVE Sensors Live files and its service. Backups and lm-sensors remain.'
-  confirm 'Uninstall PVE Sensors Live?'
+  confirm 'Uninstall PVE Sensors Live and reload the Proxmox API services?'
+  rm -f -- "$WEB/pve-sensors.json"
+  /usr/bin/python3 -I "$STAGE/patch_nodes.py" "$NODES" "$STAGE/Nodes.pm" --remove
   backup_files
   CHANGED=yes
   systemctl disable --now "$SERVICE"
+  put_file "$STAGE/Nodes.pm" "$NODES" 0644
   for file in "${FILES[@]}"; do rm -f -- "$file"; done
+  systemctl reload pvedaemon pveproxy
   systemctl daemon-reload
   systemctl reset-failed "$SERVICE" 2>/dev/null || true
   COMMITTED=yes
   say "Uninstalled. Backup retained at: $BACKUP"
-  say 'No PVE service or VM/container was restarted. APT packages were not removed.'
+  say 'Guests stay running. APT packages were not removed.'
   exit 0
 fi
 
-[[ "$ACCEPT_PUBLIC" == yes ]] || die 'Static sensor data is accessible WITHOUT LOGIN. Review README.md, then pass --accept-public-data.'
-say 'NOTICE: this dashboard and its JSON are public to clients that can reach the static URL.'
-say 'Use a trusted management network. No firewall, authentication, or PVE settings are changed.'
+say 'Sensor data requires a Proxmox session and Sys.Audit on the requested node.'
+say 'The installer patches Nodes.pm and reloads pvedaemon/pveproxy; guests stay running.'
+confirm 'Install the authenticated Sensors API?'
+# Revocation is intentionally outside rollback and precedes compatibility checks.
+rm -f -- "$WEB/pve-sensors.json"
+[[ -f "$NODES" && ! -L "$NODES" ]] || die 'Expected a regular Proxmox Nodes.pm.'
+/usr/bin/python3 -I "$STAGE/patch_nodes.py" "$NODES" "$STAGE/Nodes.pm"
 
 if [[ ! -e "$MARKER" ]]; then
   for file in "${FILES[@]}"; do
@@ -1086,15 +1211,12 @@ else
 fi
 for file in "${FILES[@]}"; do
   [[ ! -d "$file" ]] || die "Refusing to replace a directory: $file"
-  if [[ "$file" != "$WEB/pve-sensors.json" && -L "$file" ]]; then
+  if [[ -L "$file" ]]; then
     die "Unexpected symlink in a managed file: $file"
   fi
 done
 [[ "$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)" != masked ]] || die 'The service is masked; review and unmask it explicitly first.'
 
-STAGE=$(mktemp -d /tmp/pve-sensors-install.XXXXXXXX)
-chmod 0700 "$STAGE"
-write_payload "$STAGE"
 /usr/bin/python3 -I -B - "$STAGE/pve-sensors-agent.py" <<'PY'
 import pathlib, sys
 path = pathlib.Path(sys.argv[1])
@@ -1154,12 +1276,6 @@ CHANGED=yes
 if [[ "$OLD_ACTIVE" == yes ]]; then systemctl stop "$SERVICE"; fi
 install -d -m 0755 /usr/local/libexec /usr/local/share/pve-sensors
 
-put_file() {
-  local source="$1" destination="$2" mode="$3" temporary
-  temporary=$(mktemp "$(dirname "$destination")/.pve-sensors-install.XXXXXXXX")
-  install -m "$mode" -- "$source" "$temporary"
-  mv -fT -- "$temporary" "$destination"
-}
 put_file "$STAGE/pve-sensors-agent.py" "$AGENT" 0755
 put_file "$STAGE/pve-sensors.service" "$UNIT" 0644
 for extension in html css js; do
@@ -1176,8 +1292,11 @@ lines.append("PVE_SENSORS_INTERVAL=" + value)
 pathlib.Path(destination).write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
 put_file "$STAGE/new-config" "$CONFIG" 0644
-rm -f -- "$WEB/pve-sensors.json"
-ln -s -- "$RUNTIME" "$WEB/pve-sensors.json"
+put_file "$STAGE/PveSensors.pm" "$API" 0644
+# Compile the staged registration against the installed PVE modules before use.
+perl -T -c "$STAGE/Nodes.pm"
+put_file "$STAGE/Nodes.pm" "$NODES" 0644
+systemctl reload pvedaemon pveproxy
 printf '%s\n' "$VERSION" > "$STAGE/version"
 put_file "$STAGE/version" "$MARKER" 0644
 systemctl daemon-reload
@@ -1199,13 +1318,13 @@ else:
 PY
 systemctl is-active --quiet "$SERVICE" || die 'The collector is not running.'
 "$RUNUSER" -u www-data -- /usr/bin/python3 -I -c \
-  'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["metrics"]' "$WEB/pve-sensors.json"
+  'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["metrics"]' "$RUNTIME"
 
 if [[ "$SKIP_HTTP" != yes ]]; then
   # Loopback only: PVE often uses a locally signed certificate. This probe
   # deliberately skips certificate verification; browser TLS is not changed.
   /usr/bin/python3 -I - "$WEB" <<'PY'
-import json, pathlib, ssl, sys, time, urllib.request
+import pathlib, ssl, sys, time, urllib.error, urllib.request
 root = pathlib.Path(sys.argv[1])
 context = ssl._create_unverified_context()
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1214,21 +1333,27 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
                                     urllib.request.HTTPSHandler(context=context))
-for name in ("pve-sensors.html", "pve-sensors.css", "pve-sensors.js", "pve-sensors.json"):
+for name in ("pve-sensors.html", "pve-sensors.css", "pve-sensors.js"):
     url = "https://127.0.0.1:8006/pve2/js/" + name + "?probe=" + str(time.time_ns())
     try:
         with opener.open(url, timeout=5) as response:
             if response.geturl().split("?", 1)[0] != url.split("?", 1)[0]:
                 raise ValueError("Unexpected redirect")
             body = response.read(1048576)
-            if name.endswith(".json"):
-                assert json.loads(body)["metrics"]
-            else:
-                assert body == (root / name).read_bytes()
+            assert body == (root / name).read_bytes()
     except Exception as exc:
         sys.exit("HTTPS loopback verification failed (" + type(exc).__name__ +
                  "). For a restricted listener, review --skip-http-check in README.md.")
-print("Local HTTPS checks passed, without a login cookie or API token.")
+for path, expected in (("/pve2/js/pve-sensors.json", 404),
+                       ("/api2/json/nodes/localhost/sensors", 401)):
+    try:
+        opener.open("https://127.0.0.1:8006" + path, timeout=5).close()
+    except urllib.error.HTTPError as exc:
+        if exc.code != expected:
+            sys.exit(f"Unexpected HTTP {exc.code} for {path}; expected {expected}")
+    else:
+        sys.exit(f"Unauthenticated access unexpectedly succeeded: {path}")
+print("Local HTTPS checks passed: public snapshot absent; API requires authentication.")
 PY
 else
   say 'WARNING: HTTPS serving was not tested. Verify the dashboard from your management browser.'
@@ -1242,4 +1367,5 @@ say "Current snapshot: $RUNTIME (normally tmpfs)"
 say "Open /pve2/js/pve-sensors.html on this node's existing HTTPS :8006 origin."
 say 'Service: systemctl status pve-sensors.service --no-pager'
 say "Project backup: $BACKUP"
-say 'Only the project service was changed. Proxmox services and guests were not restarted.'
+say 'Proxmox API services were reloaded. Guests were not restarted.'
+say 'Log in to Proxmox on the same origin before opening the dashboard.'

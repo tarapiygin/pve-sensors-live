@@ -1,12 +1,12 @@
 # Security policy and deployment boundary
 
-PVE Sensors Live is an unauthenticated, read-only static dashboard served from the Proxmox management origin. It is not a Proxmox authentication plugin and not a substitute for access controls around the management network.
+PVE Sensors Live serves measurements through the existing Proxmox API. Proxmox validates the session and requires `Sys.Audit` on `/nodes/{node}` before the read-only handler runs. The static HTML/CSS/JavaScript shell remains public and contains no measurements. Authentication does not replace management-network access controls.
 
 ## Intended trust boundary
 
-An administrator reviews and installs the code as root on the physical host. Package installation uses that host's existing APT trust configuration. During normal operation, a dynamically allocated, non-root service identity reads the already-exposed hardware monitoring interface. The service writes only its runtime snapshot and temporary files. The existing web server reads the public snapshot and serves root-owned static assets.
+An administrator reviews and installs the code as root on the physical host. Package installation uses that host's existing APT trust configuration. During normal operation, a dynamically allocated, non-root service identity reads the already-exposed hardware monitoring interface. The service writes only its runtime snapshot and temporary files. The existing API reads the runtime snapshot after authentication and authorization; the web server serves root-owned static assets.
 
-Anyone who can reach the URL can read the snapshot, regardless of whether they have a Proxmox account. A JavaScript login check would not protect the underlying JSON and is intentionally not presented as authentication. Do not expose this dashboard on an untrusted network without a suitable access-control layer.
+The old `/pve2/js/pve-sensors.json` link is removed before patch compatibility checks and is never restored by rollback. The handler reads only `/run/pve-sensors/metrics.json`; it accepts no filesystem path and runs no sensor commands. Missing or malformed snapshots return a generic 503 without raw filesystem or decode errors.
 
 ## Defensive measures
 
@@ -16,7 +16,7 @@ Anyone who can reach the URL can read the snapshot, regardless of whether they h
 - Installed application and web files remain outside the collector's writable directory.
 - JSON is built from a narrow schema. Raw chip strings, custom labels and device identity are not forwarded.
 - Atomic publication prevents readers from seeing half-written JSON.
-- The browser inserts sensor strings as text, omits credentials from snapshot requests and loads no external assets.
+- The browser inserts sensor strings as text, uses the existing session cookie only for same-origin API requests and loads no external assets.
 - The installer refuses an unmanaged file collision, serializes its own runs, backs up managed files, and offers best-effort rollback.
 - There are no update hooks, remote code downloads, APT source edits or unattended sensor-detection commands.
 
@@ -24,11 +24,11 @@ These measures reduce risk; they are not a security certification. Code served o
 
 ## Known limitations
 
-The runtime snapshot is intentionally world-readable and publicly served. Sensor topology, temperatures and fan activity can reveal workload information even when explicit identifiers are omitted. Numeric sensor IDs are ordinal labels, not a durable inventory identity, and can change when hardware enumeration changes.
+The runtime snapshot remains locally readable by `www-data` and other host users; it has no public HTTP route. Local-host isolation is outside this API boundary. Sensor topology, temperatures and fan activity can reveal workload information even when explicit identifiers are omitted. Numeric sensor IDs are ordinal labels, not a durable inventory identity, and can change when hardware enumeration changes.
 
 `/run` normally uses tmpfs, but swap, service journals and Proxmox HTTP access logs may still cause disk writes. The project does not change host logging or memory-management policy.
 
-Collection, filesystem permissions and sandbox behavior depend on the installed distribution, systemd and hardware drivers. The static URL is not a supported extension API. An incompatible Proxmox update may break the dashboard. Tests do not prove the absence of vulnerabilities.
+Collection, filesystem permissions and sandbox behavior depend on the installed distribution, systemd and hardware drivers. The marked registration in `Nodes.pm` is not a supported extension API. A Proxmox update may remove it; an incompatible reinstallation fails closed. Re-run the reviewed installer after updates. Removal deletes only the exact marked registration, preserving other changes. Tests do not prove the absence of vulnerabilities.
 
 Backups remain under `/var/backups/pve-sensors/` for administrator recovery and may contain previous locally edited project files. They must not be committed to a public repository. The uninstaller intentionally leaves backups and package dependencies behind.
 

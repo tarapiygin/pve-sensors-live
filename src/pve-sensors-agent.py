@@ -22,7 +22,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 SENSORS = "/usr/bin/sensors"
 DEFAULT_OUTPUT = Path("/run/pve-sensors/metrics.json")
 READ_TIMEOUT = 2.0
