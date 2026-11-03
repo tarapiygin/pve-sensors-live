@@ -8,7 +8,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
 umask 022
 
-VERSION=2.0.0
+VERSION=2.1.0
 WEB=/usr/share/pve-manager/js
 AGENT=/usr/local/libexec/pve-sensors-agent.py
 UNIT=/etc/systemd/system/pve-sensors.service
@@ -18,6 +18,9 @@ RUNTIME=/run/pve-sensors/metrics.json
 SERVICE=pve-sensors.service
 NODES=/usr/share/perl5/PVE/API2/Nodes.pm
 API=/usr/share/perl5/PVE/API2/PveSensors.pm
+UI_BUNDLE=$WEB/pvemanagerlib.js
+UI_TEMPLATE=/usr/share/pve-manager/index.html.tpl
+UPSTREAM=("$NODES" "$UI_BUNDLE" "$UI_TEMPLATE")
 MODE=install
 ASSUME_YES=no
 SKIP_HTTP=no
@@ -29,7 +32,7 @@ CHANGED=no
 COMMITTED=no
 OLD_ACTIVE=no
 OLD_ENABLED=no
-FILES=("$AGENT" "$UNIT" "$CONFIG" "$WEB/pve-sensors.html"
+FILES=("$AGENT" "$UNIT" "$CONFIG"
        "$WEB/pve-sensors.css" "$WEB/pve-sensors.js" "$API" "$MARKER")
 
 say() { printf '%s\n' "$*"; }
@@ -37,7 +40,7 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-PVE Sensors Live 2.0.0
+PVE Sensors Live 2.1.0
 
 Install or upgrade (run as root on the Proxmox VE host):
   bash install.sh
@@ -59,7 +62,7 @@ Options:
 
 Only lm-sensors is requested from your existing APT repositories when absent.
 Python 3.9+, systemd and Debian base utilities must already be present on PVE.
-Adds one node API registration and reloads pvedaemon/pveproxy. Guests stay running.
+Adds node API/UI hooks and reloads pvedaemon/pveproxy. Guests stay running.
 USAGE
 }
 
@@ -182,7 +185,97 @@ def main():
 if __name__ == "__main__":
     main()
 PVE_SENSORS_EMBEDDED_FILE_2_END
-  cat > "$target/pve-sensors-agent.py" <<'PVE_SENSORS_EMBEDDED_FILE_3_END'
+  cat > "$target/patch_ui.py" <<'PVE_SENSORS_EMBEDDED_FILE_3_END'
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Apply/remove the two small native UI hooks without touching unrelated code."""
+import argparse
+import re
+from pathlib import Path
+
+TAB_BEGIN = '        // BEGIN PVE SENSORS LIVE TAB\n'
+TAB_END = '        // END PVE SENSORS LIVE TAB\n'
+TAB_BLOCK = TAB_BEGIN + '''        if (caps.nodes['Sys.Audit']) {
+            me.items.push({
+                xtype: 'pveNodeSensors',
+                title: 'Sensors',
+                iconCls: 'fa fa-thermometer-half',
+                itemId: 'pve-sensors',
+                nodename: nodename,
+            });
+        }
+''' + TAB_END
+LOAD_BEGIN = '    <!-- BEGIN PVE SENSORS LIVE ASSETS -->\n'
+LOAD_END = '    <!-- END PVE SENSORS LIVE ASSETS -->\n'
+LOAD_BLOCK = LOAD_BEGIN + '    <script type="text/javascript" src="/pve2/js/pve-sensors.js?v=2.1.0"></script>\n' + LOAD_END
+
+
+def strip_block(text, begin, end, block):
+    if begin in text or end in text:
+        if text.count(begin) != 1 or text.count(end) != 1 or block not in text:
+            raise ValueError('Changed Sensors UI registration; review the marked block manually')
+        return text.replace(block, '', 1)
+    return text
+
+
+def patch_bundle(text, remove=False):
+    text = strip_block(text, TAB_BEGIN, TAB_END, TAB_BLOCK)
+    if remove:
+        return text
+    header = "Ext.define('PVE.node.Config', {"
+    if text.count(header) != 1:
+        raise ValueError('Unsupported pvemanagerlib.js: node Config class not found uniquely')
+    start = text.index(header)
+    next_class = re.search(r'\nExt\.define\(', text[start + len(header):])
+    end = start + len(header) + next_class.start() if next_class else len(text)
+    section = text[start:end]
+    anchor = '        me.callParent();\n'
+    if section.count(anchor) != 1 or "var caps = Ext.state.Manager.get('GuiCap');" not in section:
+        raise ValueError('Unsupported node Config: tab registration anchor changed')
+    if 'pveNodeSensors' in section or "itemId: 'pve-sensors'" in section:
+        raise ValueError('Sensors tab already registered outside the managed block')
+    return text[:start] + section.replace(anchor, TAB_BLOCK + anchor, 1) + text[end:]
+
+
+def patch_template(text, remove=False):
+    # Only the cache version may differ between supported project releases.
+    if LOAD_BEGIN in text or LOAD_END in text:
+        loader = re.compile(re.escape(LOAD_BEGIN) +
+                            r'    <script type="text/javascript" src="/pve2/js/pve-sensors\.js\?v=[0-9]+\.[0-9]+\.[0-9]+"></script>\n' +
+                            re.escape(LOAD_END))
+        blocks = loader.findall(text)
+        if len(blocks) != 1:
+            raise ValueError('Changed Sensors UI loader; review the marked block manually')
+        text = strip_block(text, LOAD_BEGIN, LOAD_END, blocks[0])
+    if remove:
+        return text
+    anchor = re.compile(r'^    <script type="text/javascript" src="/pve2/js/pvemanagerlib\.js\?ver=\[% version %\]"></script>\n', re.M)
+    matches = list(anchor.finditer(text))
+    if len(matches) != 1 or '/pve2/js/pve-sensors.js' in text:
+        raise ValueError('Unsupported index.html.tpl: script anchor changed or duplicate Sensors loader')
+    offset = matches[0].end()
+    return text[:offset] + LOAD_BLOCK + text[offset:]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('kind', choices=('bundle', 'template'))
+    parser.add_argument('source', type=Path)
+    parser.add_argument('destination', type=Path)
+    parser.add_argument('--remove', action='store_true')
+    args = parser.parse_args()
+    try:
+        fn = patch_bundle if args.kind == 'bundle' else patch_template
+        result = fn(args.source.read_text(), args.remove)
+    except ValueError as exc:
+        parser.exit(1, f'{exc}\n')
+    args.destination.write_text(result)
+
+
+if __name__ == '__main__':
+    main()
+PVE_SENSORS_EMBEDDED_FILE_3_END
+  cat > "$target/pve-sensors-agent.py" <<'PVE_SENSORS_EMBEDDED_FILE_4_END'
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """Read lm-sensors without privileges and atomically publish allowlisted metrics.
@@ -207,7 +300,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 SENSORS = "/usr/bin/sensors"
 DEFAULT_OUTPUT = Path("/run/pve-sensors/metrics.json")
 READ_TIMEOUT = 2.0
@@ -428,8 +521,8 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-PVE_SENSORS_EMBEDDED_FILE_3_END
-  cat > "$target/pve-sensors.service" <<'PVE_SENSORS_EMBEDDED_FILE_4_END'
+PVE_SENSORS_EMBEDDED_FILE_4_END
+  cat > "$target/pve-sensors.service" <<'PVE_SENSORS_EMBEDDED_FILE_5_END'
 # SPDX-License-Identifier: MIT
 [Unit]
 Description=PVE Sensors Live - unprivileged hardware sensor collector
@@ -474,108 +567,19 @@ TasksMax=16
 
 [Install]
 WantedBy=multi-user.target
-PVE_SENSORS_EMBEDDED_FILE_4_END
-  cat > "$target/pve-sensors.defaults" <<'PVE_SENSORS_EMBEDDED_FILE_5_END'
+PVE_SENSORS_EMBEDDED_FILE_5_END
+  cat > "$target/pve-sensors.defaults" <<'PVE_SENSORS_EMBEDDED_FILE_6_END'
 # SPDX-License-Identifier: MIT
 # Poll interval in seconds: 0.1 to 60. Default: 0.5 (two reads per second).
 # Faster polling does not make the hardware sensor update faster.
 # Restart only pve-sensors.service after editing this file.
 PVE_SENSORS_INTERVAL=0.5
-PVE_SENSORS_EMBEDDED_FILE_5_END
-  cat > "$target/pve-sensors.html" <<'PVE_SENSORS_EMBEDDED_FILE_6_END'
-<!doctype html>
-<!-- SPDX-License-Identifier: MIT -->
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
-  <meta name="referrer" content="no-referrer">
-  <meta name="color-scheme" content="dark light">
-  <title>PVE Sensors Live | Hardware temperatures</title>
-  <link rel="stylesheet" href="./pve-sensors.css?v=2.0.0">
-  <script src="./pve-sensors.js?v=2.0.0" defer></script>
-</head>
-<body>
-  <header class="topbar">
-    <div class="topbar-inner">
-      <div class="brand"><span class="brand-mark" aria-hidden="true">°</span><span>PVE Sensors <span class="brand-muted">Live</span></span></div>
-      <a class="back-link" href="/">Back to Proxmox ↗</a>
-    </div>
-  </header>
-  <main class="layout">
-    <div class="heading-row">
-      <div>
-        <p class="eyebrow">HARDWARE TELEMETRY · NO EXTRA SERVER</p>
-        <h1>Your host, a little more visible.</h1>
-        <p class="description">Live temperatures. One lightweight collector. History stays in this tab.</p>
-      </div>
-      <div class="live-block">
-        <span id="connection" class="connection pending" role="status">Connecting</span>
-        <span id="updated" class="updated">Waiting for a snapshot</span>
-      </div>
-    </div>
-    <p id="demoBanner" class="demo-banner" hidden>SIMULATED PREVIEW · Not a real host or production measurements</p>
-    <noscript><p class="notice">JavaScript is required to display live sensor readings.</p></noscript>
-    <section class="hero-grid" aria-label="Primary temperatures">
-      <article class="panel hero-card">
-        <div class="hero-heading"><span class="sensor-symbol cpu-symbol">CPU</span><span id="cpuState" class="state neutral">No data</span></div>
-        <p class="metric-label">Processor temperature</p>
-        <div class="hero-value" id="cpuValue">—</div>
-        <p class="metric-subtitle" id="cpuName">Waiting for a CPU sensor</p>
-        <div class="meter" aria-hidden="true"><div id="cpuMeter" class="meter-fill neutral"></div></div>
-        <p id="cpuLimits" class="limits">Sensor thresholds are not available</p>
-      </article>
-      <article class="panel hero-card">
-        <div class="hero-heading"><span class="sensor-symbol nvme-symbol">SSD</span><span id="nvmeState" class="state neutral">No data</span></div>
-        <p class="metric-label">Storage temperature</p>
-        <div class="hero-value" id="nvmeValue">—</div>
-        <p class="metric-subtitle" id="nvmeName">Waiting for a storage sensor</p>
-        <div class="meter" aria-hidden="true"><div id="nvmeMeter" class="meter-fill neutral"></div></div>
-        <p id="nvmeLimits" class="limits">Sensor thresholds are not available</p>
-      </article>
-    </section>
-    <section class="panel chart-panel" aria-labelledby="chartTitle">
-      <div class="chart-head">
-        <div>
-          <h2 id="chartTitle">CPU temperature history</h2>
-          <p class="chart-caption"><span id="sampling">500 ms target interval</span> · Session-only history</p>
-        </div>
-        <label class="source-control">Chart source <select id="cpuSource" aria-label="CPU sensor for chart"><option value="">Waiting for sensors</option></select></label>
-      </div>
-      <div class="chart-stats" aria-label="Chart statistics">
-        <div><span>Current</span><strong id="chartCurrent">—</strong></div>
-        <div><span>Session minimum</span><strong id="chartMin">—</strong></div>
-        <div><span>Session maximum</span><strong id="chartMax">—</strong></div>
-        <div><span>Elapsed</span><strong id="chartDuration">00:00</strong></div>
-        <div><span>Unique snapshots</span><strong id="chartSamples">0</strong></div>
-      </div>
-      <div class="chart-canvas-wrap">
-        <canvas id="cpuChart" class="chart-canvas" role="img" aria-label="CPU temperature since this page was opened"></canvas>
-      </div>
-      <p id="historyNote" class="chart-footnote">Reloading resets history. Hidden tabs pause polling. Gaps are not invented measurements.</p>
-    </section>
-    <section class="panel section-panel">
-      <div class="section-heading"><h2>Processor sensors</h2><span class="section-note">Packages, cores and chiplets</span></div>
-      <div id="cores" class="sensor-grid"><p class="empty">Waiting for readings…</p></div>
-    </section>
-    <section class="panel section-panel">
-      <div class="section-heading"><h2>Storage &amp; other sensors</h2><span class="section-note">Read-only measurements</span></div>
-      <div id="other" class="sensor-grid"><p class="empty">Waiting for readings…</p></div>
-    </section>
-    <footer>
-      <p>Source: <code>sensors -j</code> · No telemetry · No external libraries · No server-side history</p>
-      <p>Thresholds come from the sensor, not a safety guarantee. Readings require a Proxmox session and node Sys.Audit permission.</p>
-    </footer>
-  </main>
-</body>
-</html>
 PVE_SENSORS_EMBEDDED_FILE_6_END
   cat > "$target/pve-sensors.css" <<'PVE_SENSORS_EMBEDDED_FILE_7_END'
 /* SPDX-License-Identifier: MIT */
-:root{color-scheme:dark light;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#111827;color:#eef2f7}
+.sensors-view{color-scheme:dark light;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#111827;color:#eef2f7}
 *{box-sizing:border-box}
-body{margin:0;min-height:100vh;background:radial-gradient(circle at 80% -15%,#1d3550 0,transparent 35%),#111827}
+.sensors-view{display:block;margin:0;min-height:100%;background:radial-gradient(circle at 80% -15%,#1d3550 0,transparent 35%),#111827}
 .topbar{border-bottom:1px solid #293448;background:#141c2acc}
 .topbar-inner{max-width:1120px;margin:auto;min-height:68px;padding:0 24px;display:flex;align-items:center;justify-content:space-between;gap:12px}
 .brand{display:flex;align-items:center;gap:12px;font-weight:700;font-size:15px}
@@ -628,10 +632,10 @@ footer{color:#7f91a9;font-size:11px;line-height:1.6;text-align:center;margin-top
 code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
 @media(max-width:800px){.sensor-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.heading-row{flex-direction:column}.live-block{align-items:flex-start}.updated{text-align:left}}
 @media(max-width:560px){.layout{padding:25px 15px}.topbar-inner{padding:0 15px}.hero-grid{grid-template-columns:1fr}.hero-card{padding:21px}.section-panel{padding:18px}.sensor-grid{gap:9px}.sensor-card{padding:14px 12px}.sensor-value{font-size:23px}.brand-muted{display:none}}
-@media(prefers-color-scheme:light){:root{background:#f3f5f8;color:#192533}body{background:radial-gradient(circle at 80% -15%,#e3edf8 0,transparent 40%),#f3f5f8}.topbar{background:#fff;border-color:#dce2eb}.brand-muted,.description{color:#607388}.back-link{color:#4f6074}.back-link:hover{color:#1c2939;background:#edf1f7}.panel{background:linear-gradient(145deg,#fff,#fbfcff);border-color:#dce3ed;box-shadow:0 6px 24px #22344b0a}.sensor-card{background:#f7f9fc;border-color:#e4e9f1}.metric-label,.section-note,.sensor-name{color:#607185}.metric-subtitle,.limits,.sensor-meta,.updated,.empty{color:#697d93}.sensor-value small{color:#607185}.meter{background:#e5eaf1}.connection.ok,.state.normal{background:#e5f8ef;color:#096948;border-color:#bde6d0}.connection.warning,.state.warning{background:#fff2dc;color:#8c5300;border-color:#f2d3a1}.connection.danger,.state.critical{background:#ffebed;color:#9d2636;border-color:#f4bcc5}.connection.pending,.state.neutral{background:#edf2f7;color:#5b6d82;border-color:#dbe3ec}.eyebrow{color:#ae5b16}footer{color:#8494a6}}
+@media(prefers-color-scheme:light){.sensors-view{background:#f3f5f8;color:#192533}.sensors-view{background:radial-gradient(circle at 80% -15%,#e3edf8 0,transparent 40%),#f3f5f8}.topbar{background:#fff;border-color:#dce2eb}.brand-muted,.description{color:#607388}.back-link{color:#4f6074}.back-link:hover{color:#1c2939;background:#edf1f7}.panel{background:linear-gradient(145deg,#fff,#fbfcff);border-color:#dce3ed;box-shadow:0 6px 24px #22344b0a}.sensor-card{background:#f7f9fc;border-color:#e4e9f1}.metric-label,.section-note,.sensor-name{color:#607185}.metric-subtitle,.limits,.sensor-meta,.updated,.empty{color:#697d93}.sensor-value small{color:#607185}.meter{background:#e5eaf1}.connection.ok,.state.normal{background:#e5f8ef;color:#096948;border-color:#bde6d0}.connection.warning,.state.warning{background:#fff2dc;color:#8c5300;border-color:#f2d3a1}.connection.danger,.state.critical{background:#ffebed;color:#9d2636;border-color:#f4bcc5}.connection.pending,.state.neutral{background:#edf2f7;color:#5b6d82;border-color:#dbe3ec}.eyebrow{color:#ae5b16}footer{color:#8494a6}}
 
 /* Live CPU history chart */
-:root{
+:host{
   --chart-grid:#334155;
   --chart-text:#94a3b8;
   --chart-line:#57bdff;
@@ -650,9 +654,9 @@ code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
 .chart-canvas{display:block;width:100%;height:100%;touch-action:pan-y}
 .chart-footnote{color:#8da0b7;margin:13px 0 0;font-size:11px;line-height:1.5}
 @media(max-width:560px){.chart-panel{padding:20px 12px 16px}.chart-head{flex-direction:column}.chart-stats{gap:17px;margin:17px 9px 11px}.chart-stats strong{font-size:16px}.chart-canvas-wrap{height:246px}.chart-footnote{margin-left:9px;margin-right:9px}}
-@media(prefers-color-scheme:light){:root{--chart-grid:#dae4ef;--chart-text:#728298;--chart-line:#1a77bc;--chart-area:rgba(37,134,208,.13)}.chart-caption,.chart-stats span,.chart-footnote{color:#74869c}.chart-samples{color:#296b9e;background:#e8f3fa;border-color:#d1e7f6}}
+@media(prefers-color-scheme:light){:host{--chart-grid:#dae4ef;--chart-text:#728298;--chart-line:#1a77bc;--chart-area:rgba(37,134,208,.13)}.chart-caption,.chart-stats span,.chart-footnote{color:#74869c}.chart-samples{color:#296b9e;background:#e8f3fa;border-color:#d1e7f6}}
 
-/* Public release controls; all assets are served locally. */
+/* View controls; all assets are served locally inside the panel shadow root. */
 .source-control{display:flex;flex-direction:column;gap:7px;font-size:11px;color:#94a3b8;min-width:170px}
 select{border:1px solid #40536b;border-radius:8px;padding:8px 10px;background:#152234;color:#e1ebf7;font:inherit;font-size:12px;max-width:100%}
 select:focus-visible,.back-link:focus-visible{outline:2px solid #57bdff;outline-offset:3px}
@@ -660,22 +664,101 @@ select:focus-visible,.back-link:focus-visible{outline:2px solid #57bdff;outline-
 [hidden]{display:none!important}
 .notice{padding:16px;border:1px solid #ed9d38;border-radius:8px}
 footer p{margin:5px 0}
-body.data-stale .hero-value,body.data-stale .sensor-value{opacity:.55}
+:host(.data-stale) .hero-value,:host(.data-stale) .sensor-value{opacity:.55}
 @media(max-width:560px){.source-control{width:100%}.section-heading{flex-wrap:wrap}.description{max-width:34em}.chart-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.topbar-inner{gap:8px}.brand{font-size:14px}.back-link{font-size:12px;padding:8px 0}}
 @media(prefers-color-scheme:light){select{background:#fff;border-color:#cad6e4;color:#23394f}.source-control{color:#607185}.demo-banner{background:#fff5dd;color:#7a5411;border-color:#edd7a9}}
 @media(prefers-reduced-motion:reduce){.meter-fill{transition:none}}
 PVE_SENSORS_EMBEDDED_FILE_7_END
   cat > "$target/pve-sensors.js" <<'PVE_SENSORS_EMBEDDED_FILE_8_END'
 /* SPDX-License-Identifier: MIT */
+/* Native node panel. Its DOM, chart history and polling belong to this instance. */
+(function () {
 'use strict';
 
-const byId = (id) => document.getElementById(id);
+const markup = `
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">°</span><span>PVE Sensors <span class="brand-muted">Live</span></span></div>
+    </div>
+  </header>
+  <main class="layout">
+    <div class="heading-row">
+      <div>
+        <p class="eyebrow">HARDWARE TELEMETRY · NO EXTRA SERVER</p>
+        <h1>Your host, a little more visible.</h1>
+        <p class="description">Live temperatures. One lightweight collector. History stays in this tab.</p>
+      </div>
+      <div class="live-block">
+        <span id="connection" class="connection pending" role="status">Connecting</span>
+        <span id="updated" class="updated">Waiting for a snapshot</span>
+      </div>
+    </div>
+    <p id="demoBanner" class="demo-banner" hidden>SIMULATED PREVIEW · Not a real host or production measurements</p>
+    <section class="hero-grid" aria-label="Primary temperatures">
+      <article class="panel hero-card">
+        <div class="hero-heading"><span class="sensor-symbol cpu-symbol">CPU</span><span id="cpuState" class="state neutral">No data</span></div>
+        <p class="metric-label">Processor temperature</p>
+        <div class="hero-value" id="cpuValue">—</div>
+        <p class="metric-subtitle" id="cpuName">Waiting for a CPU sensor</p>
+        <div class="meter" aria-hidden="true"><div id="cpuMeter" class="meter-fill neutral"></div></div>
+        <p id="cpuLimits" class="limits">Sensor thresholds are not available</p>
+      </article>
+      <article class="panel hero-card">
+        <div class="hero-heading"><span class="sensor-symbol nvme-symbol">SSD</span><span id="nvmeState" class="state neutral">No data</span></div>
+        <p class="metric-label">Storage temperature</p>
+        <div class="hero-value" id="nvmeValue">—</div>
+        <p class="metric-subtitle" id="nvmeName">Waiting for a storage sensor</p>
+        <div class="meter" aria-hidden="true"><div id="nvmeMeter" class="meter-fill neutral"></div></div>
+        <p id="nvmeLimits" class="limits">Sensor thresholds are not available</p>
+      </article>
+    </section>
+    <section class="panel chart-panel" aria-labelledby="chartTitle">
+      <div class="chart-head">
+        <div>
+          <h2 id="chartTitle">CPU temperature history</h2>
+          <p class="chart-caption"><span id="sampling">500 ms target interval</span> · Session-only history</p>
+        </div>
+        <label class="source-control">Chart source <select id="cpuSource" aria-label="CPU sensor for chart"><option value="">Waiting for sensors</option></select></label>
+      </div>
+      <div class="chart-stats" aria-label="Chart statistics">
+        <div><span>Current</span><strong id="chartCurrent">—</strong></div>
+        <div><span>Session minimum</span><strong id="chartMin">—</strong></div>
+        <div><span>Session maximum</span><strong id="chartMax">—</strong></div>
+        <div><span>Elapsed</span><strong id="chartDuration">00:00</strong></div>
+        <div><span>Unique snapshots</span><strong id="chartSamples">0</strong></div>
+      </div>
+      <div class="chart-canvas-wrap">
+        <canvas id="cpuChart" class="chart-canvas" role="img" aria-label="CPU temperature since this view was opened"></canvas>
+      </div>
+      <p id="historyNote" class="chart-footnote">Reopening the view resets history. Hidden tabs pause polling. Gaps are not invented measurements.</p>
+    </section>
+    <section class="panel section-panel">
+      <div class="section-heading"><h2>Processor sensors</h2><span class="section-note">Packages, cores and chiplets</span></div>
+      <div id="cores" class="sensor-grid"><p class="empty">Waiting for readings…</p></div>
+    </section>
+    <section class="panel section-panel">
+      <div class="section-heading"><h2>Storage &amp; other sensors</h2><span class="section-note">Read-only measurements</span></div>
+      <div id="other" class="sensor-grid"><p class="empty">Waiting for readings…</p></div>
+    </section>
+    <footer>
+      <p>Source: <code>sensors -j</code> · No telemetry · No external libraries · No server-side history</p>
+      <p>Thresholds come from the sensor, not a safety guarantee. Readings require a Proxmox session and node Sys.Audit permission.</p>
+    </footer>
+  </main>
+`;
+
+function createView(root, node) {
+const byId = (id) => root.getElementById(id);
 const numberFormat = new Intl.NumberFormat('en', { maximumFractionDigits: 1 });
 const fmt = (value) => numberFormat.format(value);
 const MAX_POINTS = 16000;
-const node = new URLSearchParams(window.location.search).get('node') || 'localhost';
 const snapshotUrl = '/api2/json/nodes/' + encodeURIComponent(node) + '/sensors';
 let refreshMs = 500;
+let panelActive = false;
+let destroyed = false;
+let statusTimer = null;
+let requestTimeout = null;
+const isRunning = () => panelActive && !document.hidden && !destroyed;
 let fetchTimer = null;
 let activeController = null;
 let loading = false;
@@ -884,7 +967,7 @@ function duration(ms) {
 }
 
 function requestChart() {
-  if (chartFrame !== null || document.hidden) return;
+  if (chartFrame !== null || !isRunning()) return;
   chartFrame = requestAnimationFrame(() => { chartFrame = null; drawChart(); });
 }
 
@@ -926,7 +1009,7 @@ function drawChart() {
   }
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  const css = getComputedStyle(document.documentElement);
+  const css = getComputedStyle(root.host);
   const grid = css.getPropertyValue('--chart-grid').trim();
   const text = css.getPropertyValue('--chart-text').trim();
   const line = css.getPropertyValue('--chart-line').trim();
@@ -979,8 +1062,8 @@ function updateConnection() {
   const badge = byId('connection');
   const stale = latestArrival !== null &&
     (performance.now() - latestArrival + serverAgeMs > Math.max(3000, refreshMs * 4));
-  document.body.classList.toggle('data-stale', !!errorMessage || stale);
-  if (document.hidden) {
+  root.host.classList.toggle('data-stale', !!errorMessage || stale);
+  if (!isRunning()) {
     badge.className = 'connection pending'; badge.textContent = 'Paused in background';
   } else if (errorMessage) {
     badge.className = 'connection danger'; badge.textContent = 'Connection error';
@@ -997,19 +1080,21 @@ function updateConnection() {
 }
 
 async function refresh() {
-  if (loading || document.hidden) return;
+  if (loading || !isRunning()) return;
+  fetchTimer = null;
   loading = true;
   const started = performance.now();
   const controller = new AbortController();
   activeController = controller;
-  const timeout = setTimeout(() => controller.abort(), 4000);
+  let timedOut = false;
+  requestTimeout = setTimeout(() => { timedOut = true; controller.abort(); }, 4000);
   try {
     const response = await fetch(snapshotUrl, {
       cache: 'no-store', credentials: 'same-origin', referrerPolicy: 'no-referrer', signal: controller.signal,
     });
     if (response.status === 401 || response.status === 403) {
       const error = new Error(response.status === 401
-        ? 'Log in to Proxmox on this origin, then reload this page'
+        ? 'Proxmox session expired. Log in again.'
         : 'Sys.Audit permission is required on this node');
       error.name = 'AccessError';
       throw error;
@@ -1017,6 +1102,7 @@ async function refresh() {
     if (!response.ok) throw new Error('HTTP ' + response.status);
     const raw = await response.text();
     if (raw.length > 262144) throw new Error('Sensor snapshot is too large');
+    if (!isRunning() || controller.signal.aborted) return;
     const payload = validatePayload(JSON.parse(raw).data);
     const interval = Number(payload.sample_interval_ms);
     refreshMs = Number.isFinite(interval) && interval >= 100 && interval <= 60000 ? interval : 500;
@@ -1037,41 +1123,103 @@ async function refresh() {
     }
     errorMessage = null;
   } catch (error) {
-    if (!document.hidden) errorMessage = error.name === 'AccessError' ? error.message
+    if (isRunning() && (!controller.signal.aborted || timedOut)) errorMessage = error.name === 'AccessError' ? error.message
       : error.name === 'AbortError' ? 'Request timed out' : 'Cannot read the sensor snapshot';
     breakNext = true;
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(requestTimeout);
+    requestTimeout = null;
     activeController = null;
     loading = false;
+    if (destroyed) return;
     updateConnection();
     requestChart();
-    if (!document.hidden) {
+    if (isRunning()) {
       const delay = errorMessage ? Math.max(2000, refreshMs) : Math.max(50, refreshMs - (performance.now() - started));
       fetchTimer = setTimeout(refresh, delay);
     }
   }
 }
 
-byId('cpuSource').addEventListener('change', (event) => {
+function sourceChanged(event) {
   cpuId = event.target.value || null;
   resetHistory();
   const fresh = latestArrival !== null && !errorMessage &&
     performance.now() - latestArrival + serverAgeMs <= Math.max(3000, refreshMs * 4);
   if (latestPayload) render(latestPayload, fresh);
-});
-document.addEventListener('visibilitychange', () => {
+}
+
+function syncVisibility() {
+  if (destroyed) return;
   clearTimeout(fetchTimer);
-  if (document.hidden) { activeController?.abort(); breakNext = true; }
-  else if (!loading) refresh();
+  fetchTimer = null;
+  clearInterval(statusTimer);
+  statusTimer = null;
+  if (chartFrame !== null) cancelAnimationFrame(chartFrame);
+  chartFrame = null;
+  if (isRunning()) {
+    refresh();
+    statusTimer = setInterval(() => { updateConnection(); requestChart(); }, 1000);
+    requestChart();
+  } else {
+    clearTimeout(requestTimeout);
+    requestTimeout = null;
+    activeController?.abort();
+    breakNext = true;
+  }
   updateConnection();
-});
+}
+
+const theme = window.matchMedia('(prefers-color-scheme: dark)');
+byId('cpuSource').addEventListener('change', sourceChanged);
+document.addEventListener('visibilitychange', syncVisibility);
 window.addEventListener('resize', requestChart);
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', requestChart);
-window.addEventListener('pagehide', () => { clearTimeout(fetchTimer); activeController?.abort(); });
-setInterval(() => { if (!document.hidden) { updateConnection(); requestChart(); } }, 1000);
-requestChart();
-refresh();
+theme.addEventListener('change', requestChart);
+return {
+  setActive(value) { panelActive = value; syncVisibility(); },
+  resize: requestChart,
+  destroy() {
+    if (destroyed) return;
+    panelActive = false;
+    syncVisibility();
+    destroyed = true;
+    byId('cpuSource').removeEventListener('change', sourceChanged);
+    document.removeEventListener('visibilitychange', syncVisibility);
+    window.removeEventListener('resize', requestChart);
+    theme.removeEventListener('change', requestChart);
+    history = [];
+    latestPayload = null;
+  },
+};
+}
+
+Ext.define('PVE.node.Sensors', {
+  extend: 'Ext.panel.Panel',
+  alias: 'widget.pveNodeSensors',
+  bodyStyle: 'overflow:auto',
+  border: false,
+  listeners: {
+    afterrender: function () {
+      const root = this.body.dom.attachShadow({ mode: 'open' });
+      // Trusted bundled markup only; sensor strings are rendered with textContent.
+      root.innerHTML = '<link rel="stylesheet" href="/pve2/js/pve-sensors.css?v=2.1.0">' +
+        '<div class="sensors-view">' + markup + '</div>';
+      this.sensorsView = createView(root, this.nodename);
+      root.querySelector('link').addEventListener('load', () => this.sensorsView?.resize(), { once: true });
+      this.sensorsView.setActive(this.isVisible(true));
+    },
+    activate: function () { this.sensorsView?.setActive(true); },
+    deactivate: function () { this.sensorsView?.setActive(false); },
+    show: function () { this.sensorsView?.setActive(this.isVisible(true)); },
+    hide: function () { this.sensorsView?.setActive(false); },
+    resize: function () { this.sensorsView?.resize(); },
+    beforedestroy: function () {
+      this.sensorsView?.destroy();
+      this.sensorsView = null;
+    },
+  },
+});
+}());
 PVE_SENSORS_EMBEDDED_FILE_8_END
 }
 
@@ -1119,7 +1267,7 @@ confirm() {
 backup_files() {
   install -d -m 0700 /var/backups/pve-sensors
   BACKUP=$(mktemp -d /var/backups/pve-sensors/backup.XXXXXXXX)
-  for file in "${FILES[@]}" "$NODES"; do
+  for file in "${FILES[@]}" "${UPSTREAM[@]}"; do
     if [[ -e "$file" || -L "$file" ]]; then
       [[ ! -d "$file" ]] || die "Refusing to replace a directory: $file"
       mkdir -p -- "$BACKUP/$(dirname "${file#/}")"
@@ -1129,7 +1277,7 @@ backup_files() {
   systemctl is-active --quiet "$SERVICE" && OLD_ACTIVE=yes || true
   systemctl is-enabled --quiet "$SERVICE" && OLD_ENABLED=yes || true
   printf 'active=%s\nenabled=%s\n' "$OLD_ACTIVE" "$OLD_ENABLED" > "$BACKUP/service-state.txt"
-  printf '%s\n' "${FILES[@]}" "$NODES" > "$BACKUP/managed-files.txt"
+  printf '%s\n' "${FILES[@]}" "${UPSTREAM[@]}" > "$BACKUP/managed-files.txt"
 }
 
 cleanup() {
@@ -1138,14 +1286,14 @@ cleanup() {
   if [[ "$CHANGED" == yes && "$COMMITTED" != yes ]]; then
     say 'Installation did not finish. Attempting to restore project files and service state.' >&2
     systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
-    for file in "${FILES[@]}" "$NODES"; do
+    for file in "${FILES[@]}" "${UPSTREAM[@]}"; do
       rm -f -- "$file" || restore_failed=yes
       if [[ -e "$BACKUP/${file#/}" || -L "$BACKUP/${file#/}" ]]; then
         cp -a -- "$BACKUP/${file#/}" "$file" || restore_failed=yes
       fi
     done
-    # Never restore the old public snapshot, even when reverting a v1 upgrade.
-    rm -f -- "$WEB/pve-sensors.json" || restore_failed=yes
+    # Never restore the old public snapshot or standalone page on rollback.
+    rm -f -- "$WEB/pve-sensors.json" "$WEB/pve-sensors.html" || restore_failed=yes
     systemctl reload pvedaemon pveproxy || restore_failed=yes
     systemctl daemon-reload || restore_failed=yes
     if [[ "$OLD_ENABLED" == yes ]]; then systemctl enable "$SERVICE" >/dev/null 2>&1 || restore_failed=yes; fi
@@ -1175,15 +1323,32 @@ put_file() {
   mv -fT -- "$temporary" "$destination"
 }
 
+# Prepare all patches before replacing any upstream file. Removal strips only
+# our exact blocks from the current files, preserving unrelated package edits.
+stage_patches() {
+  for file in "${UPSTREAM[@]}"; do
+    [[ -f "$file" && ! -L "$file" ]] || die "Expected a regular Proxmox file: $file"
+  done
+  /usr/bin/python3 -I "$STAGE/patch_nodes.py" "$NODES" "$STAGE/Nodes.pm" "$@"
+  /usr/bin/python3 -I "$STAGE/patch_ui.py" bundle "$UI_BUNDLE" "$STAGE/pvemanagerlib.js" "$@"
+  /usr/bin/python3 -I "$STAGE/patch_ui.py" template "$UI_TEMPLATE" "$STAGE/index.html.tpl" "$@"
+}
+
+put_patches() {
+  put_file "$STAGE/Nodes.pm" "$NODES" 0644
+  put_file "$STAGE/pvemanagerlib.js" "$UI_BUNDLE" 0644
+  put_file "$STAGE/index.html.tpl" "$UI_TEMPLATE" 0644
+}
+
 if [[ "$MODE" == uninstall ]]; then
   [[ -f "$MARKER" && ! -L "$MARKER" ]] || die 'No installation marker found; refusing to remove unowned files.'
   confirm 'Uninstall PVE Sensors Live and reload the Proxmox API services?'
-  rm -f -- "$WEB/pve-sensors.json"
-  /usr/bin/python3 -I "$STAGE/patch_nodes.py" "$NODES" "$STAGE/Nodes.pm" --remove
+  rm -f -- "$WEB/pve-sensors.json" "$WEB/pve-sensors.html"
+  stage_patches --remove
   backup_files
   CHANGED=yes
   systemctl disable --now "$SERVICE"
-  put_file "$STAGE/Nodes.pm" "$NODES" 0644
+  put_patches
   for file in "${FILES[@]}"; do rm -f -- "$file"; done
   systemctl reload pvedaemon pveproxy
   systemctl daemon-reload
@@ -1195,12 +1360,11 @@ if [[ "$MODE" == uninstall ]]; then
 fi
 
 say 'Sensor data requires a Proxmox session and Sys.Audit on the requested node.'
-say 'The installer patches Nodes.pm and reloads pvedaemon/pveproxy; guests stay running.'
-confirm 'Install the authenticated Sensors API?'
+say 'The installer patches Nodes.pm, pvemanagerlib.js and index.html.tpl, then reloads pvedaemon/pveproxy; guests stay running.'
+confirm 'Install the authenticated Sensors API and native tab?'
 # Revocation is intentionally outside rollback and precedes compatibility checks.
-rm -f -- "$WEB/pve-sensors.json"
-[[ -f "$NODES" && ! -L "$NODES" ]] || die 'Expected a regular Proxmox Nodes.pm.'
-/usr/bin/python3 -I "$STAGE/patch_nodes.py" "$NODES" "$STAGE/Nodes.pm"
+rm -f -- "$WEB/pve-sensors.json" "$WEB/pve-sensors.html"
+stage_patches
 
 if [[ ! -e "$MARKER" ]]; then
   for file in "${FILES[@]}"; do
@@ -1278,7 +1442,7 @@ install -d -m 0755 /usr/local/libexec /usr/local/share/pve-sensors
 
 put_file "$STAGE/pve-sensors-agent.py" "$AGENT" 0755
 put_file "$STAGE/pve-sensors.service" "$UNIT" 0644
-for extension in html css js; do
+for extension in css js; do
   put_file "$STAGE/pve-sensors.$extension" "$WEB/pve-sensors.$extension" 0644
 done
 # Preserve administrator comments/settings; only update the supported interval.
@@ -1295,7 +1459,7 @@ put_file "$STAGE/new-config" "$CONFIG" 0644
 put_file "$STAGE/PveSensors.pm" "$API" 0644
 # Compile the staged registration against the installed PVE modules before use.
 perl -T -c "$STAGE/Nodes.pm"
-put_file "$STAGE/Nodes.pm" "$NODES" 0644
+put_patches
 systemctl reload pvedaemon pveproxy
 printf '%s\n' "$VERSION" > "$STAGE/version"
 put_file "$STAGE/version" "$MARKER" 0644
@@ -1320,9 +1484,10 @@ systemctl is-active --quiet "$SERVICE" || die 'The collector is not running.'
 "$RUNUSER" -u www-data -- /usr/bin/python3 -I -c \
   'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d["metrics"]' "$RUNTIME"
 
-# The public path must stay absent even when HTTPS checks are skipped.
-[[ ! -e "$WEB/pve-sensors.json" && ! -L "$WEB/pve-sensors.json" ]] \
-  || die 'The public sensor JSON path still exists.'
+# The public paths must stay absent even when HTTPS checks are skipped.
+for file in "$WEB/pve-sensors.json" "$WEB/pve-sensors.html"; do
+  [[ ! -e "$file" && ! -L "$file" ]] || die "Obsolete public path still exists: $file"
+done
 
 if [[ "$SKIP_HTTP" != yes ]]; then
   # Loopback only: PVE often uses a locally signed certificate. This probe
@@ -1337,7 +1502,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
                                     urllib.request.HTTPSHandler(context=context))
-for name in ("pve-sensors.html", "pve-sensors.css", "pve-sensors.js"):
+for name in ("pve-sensors.css", "pve-sensors.js"):
     url = "https://127.0.0.1:8006/pve2/js/" + name + "?probe=" + str(time.time_ns())
     try:
         with opener.open(url, timeout=5) as response:
@@ -1351,6 +1516,7 @@ for name in ("pve-sensors.html", "pve-sensors.css", "pve-sensors.js"):
 # PVE's static-file handler can report a missing file as 500, not 404.
 # Keep the API authentication check strict and reject exposed measurements.
 for path, expected in (("/pve2/js/pve-sensors.json", (404, 500)),
+                       ("/pve2/js/pve-sensors.html", (404, 500)),
                        ("/api2/json/nodes/localhost/sensors", (401,))):
     try:
         opener.open("https://127.0.0.1:8006" + path, timeout=5).close()
@@ -1383,8 +1549,8 @@ say ''
 say "PVE Sensors Live $VERSION installed."
 say "Collector interval: $INTERVAL seconds"
 say "Current snapshot: $RUNTIME (normally tmpfs)"
-say "Open /pve2/js/pve-sensors.html on this node's existing HTTPS :8006 origin."
+say 'Reload the Proxmox browser page, then open Node -> Sensors.'
 say 'Service: systemctl status pve-sensors.service --no-pager'
 say "Project backup: $BACKUP"
 say 'Proxmox API services were reloaded. Guests were not restarted.'
-say 'Log in to Proxmox on the same origin before opening the dashboard.'
+say 'After a pve-manager update, rerun this installer to reapply compatible hooks.'

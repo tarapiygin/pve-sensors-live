@@ -1,12 +1,12 @@
 # Security policy and deployment boundary
 
-PVE Sensors Live serves measurements through the existing Proxmox API. Proxmox validates the session and requires `Sys.Audit` on `/nodes/{node}` before the read-only handler runs. The static HTML/CSS/JavaScript shell remains public and contains no measurements. Authentication does not replace management-network access controls.
+PVE Sensors Live serves measurements through the existing Proxmox API. Proxmox validates the session and requires `Sys.Audit` on `/nodes/{node}` before the read-only handler runs. The widget JavaScript and CSS remain public and contain no measurements. The obsolete standalone HTML page is removed; the widget opens through Node → Sensors after login. Authentication does not replace management-network access controls.
 
 ## Intended trust boundary
 
 An administrator reviews and installs the code as root on the physical host. Package installation uses that host's existing APT trust configuration. During normal operation, a dynamically allocated, non-root service identity reads the already-exposed hardware monitoring interface. The service writes only its runtime snapshot and temporary files. The existing API reads the runtime snapshot after authentication and authorization; the web server serves root-owned static assets.
 
-The old `/pve2/js/pve-sensors.json` link is removed before patch compatibility checks and is never restored by rollback. The handler reads only `/run/pve-sensors/metrics.json`; it accepts no filesystem path and runs no sensor commands. Missing or malformed snapshots return a generic 503 without raw filesystem or decode errors.
+The old `/pve2/js/pve-sensors.json` link and `/pve2/js/pve-sensors.html` page are removed before patch compatibility checks and are never restored by rollback. The handler reads only `/run/pve-sensors/metrics.json`; it accepts no filesystem path and runs no sensor commands. Missing or malformed snapshots return a generic 503 without raw filesystem or decode errors.
 
 ## Defensive measures
 
@@ -16,6 +16,7 @@ The old `/pve2/js/pve-sensors.json` link is removed before patch compatibility c
 - Installed application and web files remain outside the collector's writable directory.
 - JSON is built from a narrow schema. Raw chip strings, custom labels and device identity are not forwarded.
 - Atomic publication prevents readers from seeing half-written JSON.
+- The panel isolates its styles with Shadow DOM (not a security boundary), aborts requests and removes listeners/timers when closed.
 - The browser inserts sensor strings as text, uses the existing session cookie only for same-origin API requests and loads no external assets.
 - The installer refuses an unmanaged file collision, serializes its own runs, backs up managed files, and offers best-effort rollback.
 - There are no update hooks, remote code downloads, APT source edits or unattended sensor-detection commands.
@@ -28,7 +29,7 @@ The runtime snapshot remains locally readable by `www-data` and other host users
 
 `/run` normally uses tmpfs, but swap, service journals and Proxmox HTTP access logs may still cause disk writes. The project does not change host logging or memory-management policy.
 
-Collection, filesystem permissions and sandbox behavior depend on the installed distribution, systemd and hardware drivers. The marked registration in `Nodes.pm` is not a supported extension API. A Proxmox update may remove it; an incompatible reinstallation fails closed. Re-run the reviewed installer after updates. Removal deletes only the exact marked registration, preserving other changes. Tests do not prove the absence of vulnerabilities.
+Collection, filesystem permissions and sandbox behavior depend on the installed distribution, systemd and hardware drivers. The marked hooks in `Nodes.pm`, `pvemanagerlib.js` and `index.html.tpl` are not a supported extension API. A Proxmox update may remove them; an incompatible reinstallation fails closed. Re-run the reviewed installer after updates. Removal deletes only the recognized marked hooks, preserving other changes. Tests do not prove the absence of vulnerabilities.
 
 Backups remain under `/var/backups/pve-sensors/` for administrator recovery and may contain previous locally edited project files. They must not be committed to a public repository. The uninstaller intentionally leaves backups and package dependencies behind.
 

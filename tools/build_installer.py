@@ -8,10 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 FILES = (
     ("src/api/PveSensors.pm", "PveSensors.pm"),
     ("src/api/patch_nodes.py", "patch_nodes.py"),
+    ("src/ui/patch_ui.py", "patch_ui.py"),
     ("src/pve-sensors-agent.py", "pve-sensors-agent.py"),
     ("src/pve-sensors.service", "pve-sensors.service"),
     ("src/pve-sensors.defaults", "pve-sensors.defaults"),
-    ("src/web/pve-sensors.html", "pve-sensors.html"),
     ("src/web/pve-sensors.css", "pve-sensors.css"),
     ("src/web/pve-sensors.js", "pve-sensors.js"),
 )
